@@ -1,0 +1,90 @@
+#!/bin/sh
+
+echo "======================START `date +%H:%S:%M`==========================="
+
+#Declare variable
+TODAY=`date +%Y%m%d`
+. ${HOME}/.bash_profile
+BINETC=${HOME}/bin/etc
+
+CONN_STR=`${BINETC}/boscfgmng -m1 -s21`
+USER=`${BINETC}/boscfgmng -m1 -s22`
+PSWD=`${BINETC}/boscfgmng -m1 -s23`
+
+#Main process
+
+sqlplus ${USER}/${PSWD}@${CONN_STR} << EOF
+
+DECLARE
+
+    CNT     NUMBER;
+
+BEGIN
+	VN.PCW_BANK_TRANS_DT_CRET_P(TO_CHAR(SYSDATE, 'YYYYMMDD'), 'DAILY', CNT);
+	COMMIT;
+END;
+/
+
+DROP SEQUENCE VN.BANK_BIDV_SEQ;
+
+CREATE SEQUENCE VN.BANK_BIDV_SEQ
+	START WITH 1
+	INCREMENT BY 1;
+
+GRANT SELECT ON VN.BANK_BIDV_SEQ TO PUBLIC;
+
+/
+
+DROP SEQUENCE VN.BANK_VCB_SEQ;
+
+CREATE SEQUENCE VN.BANK_VCB_SEQ
+	START WITH 1
+	INCREMENT BY 1;
+
+GRANT SELECT ON VN.BANK_VCB_SEQ TO PUBLIC;
+
+/
+
+DROP SEQUENCE VN.CWW02M00_SEQ;
+
+CREATE SEQUENCE VN.CWW02M00_SEQ
+	START WITH 1
+	INCREMENT BY 1;
+
+GRANT SELECT ON VN.CWW02M00_SEQ TO PUBLIC;
+
+/
+
+DROP SEQUENCE VN.CWW02M10_SEQ;
+
+CREATE SEQUENCE VN.CWW02M10_SEQ
+	START WITH 1
+	INCREMENT BY 1;
+
+GRANT SELECT ON VN.CWW02M10_SEQ TO PUBLIC;
+
+/
+
+DROP SEQUENCE VN.CWW02M20_SEQ;
+
+CREATE SEQUENCE VN.CWW02M20_SEQ
+	START WITH 1
+	INCREMENT BY 1;
+
+GRANT SELECT ON VN.CWW02M20_SEQ TO PUBLIC;
+
+/
+
+EOF
+
+echo ""
+echo "================================================="
+echo "==         END  BANK BATCH ($TODAY)          =="
+echo "================================================="
+echo ""
+
+
+exit
+
+
+

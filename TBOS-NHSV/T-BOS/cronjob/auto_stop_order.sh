@@ -1,0 +1,15 @@
+#!/bin/sh
+
+. /VNST/vnst/.vnst_profile
+
+cd /VNST/vnst/cronjob
+
+RUN_PATH=/VNST/vnst/bin/day
+
+#main
+	
+	${RUN_PATH}/auto_stop_order SO 100000 &
+	
+	
+	
+

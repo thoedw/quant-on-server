@@ -1,0 +1,52 @@
+#!/bin/bash
+
+. ${HOME}/.bash_profile
+
+if [[ -z $DFIFHOME ]] ; then
+	BASE=$HOME
+else
+	BASE=$DFIFHOME
+fi
+
+SHLDIR=${BASE}/bin/shell
+source ${SHLDIR}/.dbcinfo
+
+LOGDIR=${BASE}/../log/etc
+PNM=$(basename $0)
+LOGFILE=${LOGDIR}/${PNM%.*}.log
+
+sqlplus ${USER}/${PSWD}@${DBNM} << _EOF_
+spool ${LOGFILE}
+
+INSERT  INTO XIH03M11
+	SELECT
+		XIH03M11_SEQ.NEXTVAL AS ORD_SEQ_NO,
+		70 AS DAT_LEN,
+		SUBSTRB(SND_DAT, 1, 9)
+		||RPAD(KFX_ACCP_NO_SEQ.NEXTVAL, 8, ' ')
+		||SUBSTRB(SND_DAT, 18, 18)
+		||DECODE(TRUNC(DBMS_RANDOM.VALUE(1, 3)), 1, 'B', 'S')
+		||RPAD(VOL, 8, ' ')
+		||RPAD(VOL, 8, ' ')
+		||RPAD(TRUNC(DBMS_RANDOM.VALUE(75, 85))/10, 6, ' ')
+		||SUBSTRB(SND_DAT, 59, 12) AS SND_DAT,
+		0 AS SND_TP,
+		TO_CHAR(SYSDATE, 'HH24MISS') AS SND_TIME,
+		0 AS AGN_PROC_CNT,
+		0 AS FEP_SEQ,
+		SYSDATE AS WORK_DTM
+	FROM 
+	(
+		SELECT 	
+			SND_DAT
+			,(SELECT TRUNC(DBMS_RANDOM.VALUE(10, 20))*10 FROM DUAL) VOL
+		FROM 	XIH03M11
+		WHERE 	ORD_SEQ_NO = 323
+	)
+	CONNECT BY LEVEL <= ${1}
+
+spool off
+
+_EOF_
+
+exit

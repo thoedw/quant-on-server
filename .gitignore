@@ -1,0 +1,53 @@
+# ── Database & Data ────────────────────────────────────────
+data/*.db
+data/*.db-wal
+data/*.db-shm
+data/*.sqlite
+data/*.db-journal
+data/sync_*.log
+
+# ── Virtual Environments ───────────────────────────────────
+venv/
+venv_py11/
+venv_old_broken/
+.venv/
+
+# ── Logs ──────────────────────────────────────────────────
+*.log
+logs/
+/tmp/
+
+# ── Python Cache ───────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# ── Secrets & Credentials ─────────────────────────────────
+.env
+.env.*
+secrets/
+*.key
+*.pem
+
+# ── IDE ────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ── Oracle backup ──────────────────────────────────────────
+/data_128g/
+
+# ── Misc ───────────────────────────────────────────────────
+*.DS_Store
+*.ipynb_checkpoints/
+scratch/
+*.tmp
+
+# ── Data directory — chỉ keep cấu trúc, không push data ──
+data/*.sql
+data/*.corrupted
+data/*.bak
+data/

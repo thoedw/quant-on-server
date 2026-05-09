@@ -1,0 +1,757 @@
+#!/usr/bin/env python3
+"""
+scripts/vwap_watchlist_scan.py
+══════════════════════════════════════════════════════════
+Batch VWAP + Whale Hunter scan cho toàn bộ watchlist từ DB.
+
+Cách dùng:
+  PYTHONPATH=. python3 scripts/vwap_watchlist_scan.py
+  PYTHONPATH=. python3 scripts/vwap_watchlist_scan.py --name vip
+  PYTHONPATH=. python3 scripts/vwap_watchlist_scan.py --loop            # realtime mode, refresh 60s
+  PYTHONPATH=. python3 scripts/vwap_watchlist_scan.py --loop --interval 30  # refresh 30s
+  PYTHONPATH=. python3 scripts/vwap_watchlist_scan.py --signals-only    # chỉ in mã có signal
+  PYTHONPATH=. python3 scripts/vwap_watchlist_scan.py --top 5            # top N mã delta dương nhất
+  PYTHONPATH=. python3 scripts/vwap_watchlist_scan.py --date 2026-04-25  # ngày khác
+
+Alias (trong .zshrc):
+  qwvwap              → scan 1 lần (bảng + detail)
+  qwvwap-live         → live dashboard (loop 60s, chỉ bảng)
+  qwvwap-sig          → chỉ hiện mã có signal
+"""
+
+import os, sys, math, re, argparse, time, io, logging, contextlib
+from collections import defaultdict
+from datetime import datetime, timezone, timedelta
+
+
+@contextlib.contextmanager
+def _silent():
+    """Tắt tất cả stdout + logging trong khối compute — tránh cuộn terminal live mode."""
+    # 1. Tắt logging toàn bộ
+    old_levels = {}
+    for name, lgr in logging.Logger.manager.loggerDict.items():
+        if isinstance(lgr, logging.Logger):
+            old_levels[name] = lgr.level
+            lgr.setLevel(logging.CRITICAL + 1)
+    root = logging.getLogger()
+    old_root = root.level
+    root.setLevel(logging.CRITICAL + 1)
+
+    # 2. Redirect stdout → devnull
+    old_stdout = sys.stdout
+    sys.stdout = open(os.devnull, 'w')
+    try:
+        yield
+    finally:
+        sys.stdout.close()
+        sys.stdout = old_stdout
+        root.setLevel(old_root)
+        for name, lv in old_levels.items():
+            lgr = logging.Logger.manager.loggerDict.get(name)
+            if isinstance(lgr, logging.Logger):
+                lgr.setLevel(lv)
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, PROJECT_ROOT)
+
+import sqlite3
+from realtime.vwap_engine import VWAPEngine, _session_open_utc
+from realtime.watchlist_db import load_watchlist
+from scripts.whale_hunter import (
+    score_hidden_accumulation, score_vwap_reclaim, score_delta_divergence,
+    score_vwap_rejection, score_pvwap_support_test, score_vwap_bounce,
+    _compute_vol_surge, WhaleHunter, MIN_SCORE, SIDE_QUALITY_GATE,
+)
+
+VN_TZ = timezone(timedelta(hours=7))
+DB    = os.getenv("SMD_DB_PATH", os.path.join(PROJECT_ROOT, "data", "securities_master.db"))
+
+# ════════════════════════════════════════════════════════════════
+# SESSION CACHE — giảm SQLite queries cho data static trong ngày
+# ════════════════════════════════════════════════════════════════
+# Dữ liệu được cache:
+#   meta   : symbol → (security_id, exchange)   — không đổi, reset khi restart
+#   pvwap  : symbol → pvwap_row list            — đổi khi sang ngày mới
+#   wlist  : list_name → [symbols]              — stable trong session
+# Dữ liệu KHÔNG cache:
+#   stock_prices 1m bars                        — realtime, luôn đọc mới
+#   market side coverage                        — realtime
+_SCAN_CACHE: dict = {
+    'date'  : None,   # trade date đang cache
+    'meta'  : {},     # symbol → (security_id, exchange)
+    'pvwap' : {},     # symbol → list[Row]
+    'wlist' : {},     # list_name → [str]
+}
+
+def _cache_check(date_vn: str):
+    """Reset pvwap cache khi sang ngày mới. meta và wlist không cần reset."""
+    if _SCAN_CACHE['date'] != date_vn:
+        _SCAN_CACHE['date'] = date_vn
+        _SCAN_CACHE['pvwap'].clear()
+        # Không xoá meta/wlist — symbols và security_id không đổi theo ngày
+
+ICONS = {
+    'HIDDEN_ACCUMULATION': '🐋', 'VWAP_RECLAIM': '🚀',
+    'DELTA_DIVERGENCE': '📊',    'VWAP_REJECTION': '🔴',
+    'PVWAP_SUPPORT_TEST': '🎯',  'VWAP_BOUNCE': '🔁',
+}
+
+G = "\033[92m"; R = "\033[91m"; Y = "\033[93m"; C = "\033[96m"
+B = "\033[1m";  E = "\033[0m"
+
+# ANSI helpers cho in-place rendering
+CUR_HOME  = "\033[H"           # về góc trên trái
+CUR_SAVE  = "\033[s"           # save cursor pos
+CUR_REST  = "\033[u"           # restore cursor pos
+EOL_ERASE = "\033[K"           # xoá từ cursor đến cuối dòng
+HIDE_CUR  = "\033[?25l"       # ẩn cursor
+SHOW_CUR  = "\033[?25h"       # hiện cursor lại
+
+_ANSI_RE = re.compile(r'\033\[[0-9;]*[mK]')  # để đo độ rộng thực
+
+def _visible_len(s: str) -> int:
+    """Độ dài hiển thị thực (bỏ ANSI escape codes)."""
+    return len(_ANSI_RE.sub('', s))
+
+
+# ════════════════════════════════════════════════════════════════
+# ANALYSIS CORE
+# ════════════════════════════════════════════════════════════════
+
+def analyze_symbol(conn, sid, symbol, exchange, DATE_VN, session_open, all_snaps, wh, delta_reliable):
+    """Phân tích một mã. Trả về dict kết quả hoặc None nếu không có dữ liệu."""
+    # pvwap_row: cache cả ngày vì PVWAP luôn lấy từ ngày hôm qua trở về trước
+    if symbol not in _SCAN_CACHE['pvwap']:
+        _SCAN_CACHE['pvwap'][symbol] = conn.execute('''
+            SELECT trade_date, vwap, vwap_upper1, vwap_lower1, vwap_upper2, vwap_lower2,
+                   cum_volume, cum_delta, buy_vol, sell_vol, side_cov_pct, session_open, session_close
+            FROM daily_vwap_summary
+            WHERE security_id=? AND trade_date < ?
+            ORDER BY trade_date DESC LIMIT 5
+        ''', (sid, DATE_VN)).fetchall()
+    pvwap_row = _SCAN_CACHE['pvwap'][symbol]
+
+    pv         = pvwap_row[0]['vwap']      if pvwap_row else None
+    pv_date    = pvwap_row[0]['trade_date'] if pvwap_row else None
+    hist_deltas = [(r['trade_date'], r['cum_delta'] or 0) for r in pvwap_row]
+
+    # Session cap theo sàn: loại ATC candle (Open=Close=settlement)
+    # REVERT: ATC được include vì giá Close = giá đóng cửa chính thức, volume thật.
+    # BVC fix cho ATC: dùng close-vs-open direction thay vì Parkinson (H=L=0).
+
+    rows = conn.execute('''
+        SELECT trade_time, open, high, low, close, volume,
+               COALESCE(buy_vol,0) as bv, COALESCE(sell_vol,0) as sv,
+               COALESCE(buy_vol,0)-COALESCE(sell_vol,0) as delta
+        FROM stock_prices
+        WHERE security_id=? AND interval='1m'
+          AND trade_time>=? AND date(trade_time)=?
+        ORDER BY trade_time
+    ''', (sid, session_open, DATE_VN)).fetchall()
+
+    if not rows:
+        return None
+
+    last      = rows[-1];  first = rows[0]
+
+    # ── Ceiling / Floor detection ─────────────────────────────────
+    # Khi mã kịch trần/sàn, DNSE volume≈0 (không có lệnh khớp)
+    # nhưng MASVN ghi cumulative buy_vol lớn → delta vô nghĩa.
+    # Candle bị lỗi: vol=0 nhưng (buy+sell) > 500 CP → zero out side.
+    cleaned = []
+    limit_candles = 0
+    for r in rows:
+        vol = r[5] or 0
+        bv  = r[6] or 0
+        sv  = r[7] or 0
+        if (bv + sv) > max(vol, 1) * 10:   # MASVN side >> DNSE vol → ceiling/floor
+            limit_candles += 1
+            cleaned.append((r[0], r[1], r[2], r[3], r[4], vol, 0, 0, 0))
+        else:
+            cleaned.append(r)
+    rows = cleaned
+    is_limit = limit_candles > len(rows) * 0.3   # >30% nến bị lỗi → limit stock
+
+    total_vol = sum(r[5] for r in rows) or 1
+    total_bv  = sum(r[6] for r in rows)
+    total_sv  = sum(r[7] for r in rows)
+    total_d   = sum(r[8] for r in rows)
+    h_high    = max(r[2] for r in rows)
+    h_low     = min(r[3] for r in rows)
+    side_cov  = round((total_bv + total_sv) * 100.0 / total_vol, 1)
+
+    cum_pv = cum_v = cum_pv2 = 0.0
+    for r in rows:
+        p = r[4] or 0.0; v = r[5] or 0
+        cum_pv += p * v; cum_v += v; cum_pv2 += p * p * v
+    vwap_t = cum_pv / cum_v if cum_v > 0 else last[4]
+    std     = math.sqrt(max(0, (cum_pv2 / cum_v) - vwap_t ** 2)) if cum_v > 0 else 0
+
+    close_c = last[4]
+    vs_vwap = (close_c - vwap_t) / vwap_t * 100 if vwap_t else 0
+    vs_pv   = (close_c - pv) / pv * 100 if pv else None
+
+    # Delta per hour
+    hour_buckets = defaultdict(lambda: {'bv': 0, 'sv': 0, 'v': 0})
+    for r in rows:
+        t_str = str(r[0]).replace('T', ' ')
+        nums  = re.findall(r'\d+', t_str)
+        h_vn  = int(nums[3]) if len(nums) > 3 else 0
+        bk    = f'{h_vn:02d}h'
+        hour_buckets[bk]['bv'] += r[6]
+        hour_buckets[bk]['sv'] += r[7]
+        hour_buckets[bk]['v']  += r[5]
+
+    # VWAP bounces (20 nến cuối)
+    bounces = 0; was_below = False
+    for r in rows[-20:]:
+        c = r[4] or 0.0
+        if c <= 0: continue
+        if c < vwap_t * 0.998: was_below = True
+        elif was_below and c >= vwap_t * 0.998:
+            bounces += 1; was_below = False
+
+    # Whale signals — bỏ qua nếu là limit-price stock (delta không đáng tin)
+    signals  = []
+    snap_obj = all_snaps.get(sid)
+    if snap_obj and not is_limit:
+        snap = {
+            'snapshot_time': snap_obj.snapshot_time,
+            'vwap': snap_obj.vwap, 'last_close': snap_obj.last_close,
+            'vwap_upper1': snap_obj.vwap_upper1, 'vwap_lower1': snap_obj.vwap_lower1,
+            'vwap_upper2': snap_obj.vwap_upper2, 'vwap_lower2': snap_obj.vwap_lower2,
+            'cum_volume': snap_obj.cum_volume, 'cum_delta': snap_obj.cum_delta,
+        }
+        recent   = wh._get_recent_candles(conn, sid, n=12)
+        vs_s     = _compute_vol_surge(recent)
+        pvwap_wh = wh._get_pvwap(conn, sid)
+        prev     = wh._get_prev_vwap(conn, sid, snap['snapshot_time'])
+
+        checks = [
+            ('HIDDEN_ACCUMULATION', 'BUY',  *score_hidden_accumulation(snap, recent, vs_s, delta_reliable)),
+            ('DELTA_DIVERGENCE',    'BUY',  *score_delta_divergence(snap, recent, vs_s, delta_reliable)),
+            ('PVWAP_SUPPORT_TEST',  'BUY',  *score_pvwap_support_test(snap, pvwap_wh, recent, vs_s, delta_reliable)),
+            ('VWAP_BOUNCE',         'BUY',  *score_vwap_bounce(snap, recent, vs_s)),
+        ]
+        s2, d2 = score_vwap_reclaim(snap, prev, vs_s, delta_reliable)
+        s4, d4 = score_vwap_rejection(snap, recent, vs_s, delta_reliable)
+        if s2 >= MIN_SCORE: checks.append(('VWAP_RECLAIM',  'BUY',  s2, d2))
+        if s4 >= MIN_SCORE: checks.append(('VWAP_REJECTION', 'SELL', s4, d4))
+
+        for sig, dir_, sc, det in checks:
+            if sc >= MIN_SCORE:
+                signals.append((sig, dir_, sc, det))
+        signals.sort(key=lambda x: -x[2])
+
+    return {
+        'sym': symbol, 'close': close_c, 'open': first[1],
+        'high': h_high, 'low': h_low,
+        'vwap': vwap_t, 'std': std,
+        'pvwap': pv, 'pvwap_date': pv_date,
+        'vs_vwap': vs_vwap, 'vs_pv': vs_pv,
+        'delta': total_d, 'total_vol': total_vol,
+        'buy_vol': total_bv, 'sell_vol': total_sv,
+        'side_cov': side_cov, 'ncandles': len(rows),
+        'bounces': bounces, 'signals': signals,
+        'hist_deltas': hist_deltas,
+        'hour_buckets': dict(hour_buckets),
+        'is_limit': is_limit,          # True nếu mã kịch trần/sàn
+        'limit_candles': limit_candles, # Số nến bị lọc
+    }
+
+
+# ════════════════════════════════════════════════════════════════
+# INDEX ANALYSIS (đọc từ market_indices / index_vwap_summary)
+# ════════════════════════════════════════════════════════════════
+
+MARKET_INDEX_CODES = {'VNINDEX', 'VN30', 'VN100', 'HNX30'}
+
+
+def analyze_index_symbol(conn, symbol: str, DATE_VN: str) -> dict | None:
+    """Phân tích chỉ số thị trường từ market_indices + index_vwap_summary.
+    Trả về dict cùng cấu trúc với analyze_symbol() để tái dùng display functions.
+    """
+    rows = conn.execute('''
+        SELECT trade_time, open, high, low, close, volume,
+               COALESCE(buy_vol,0)  AS bv,
+               COALESCE(sell_vol,0) AS sv,
+               COALESCE(buy_vol,0)-COALESCE(sell_vol,0) AS delta
+        FROM market_indices
+        WHERE index_code=? AND interval='1m'
+          AND date(trade_time)=?
+        ORDER BY trade_time
+    ''', (symbol, DATE_VN)).fetchall()
+
+    if not rows:
+        return None
+
+    last  = rows[-1];  first = rows[0]
+    total_vol = sum(r[5] for r in rows) or 1
+    total_bv  = sum(r[6] for r in rows)
+    total_sv  = sum(r[7] for r in rows)
+    total_d   = sum(r[8] for r in rows)
+    h_high    = max(r[2] for r in rows)
+    h_low     = min(r[3] for r in rows)
+    side_cov  = round((total_bv + total_sv) * 100.0 / total_vol, 1)
+
+    cum_pv = cum_v = cum_pv2 = 0.0
+    for r in rows:
+        p = r[4] or 0.0; v = r[5] or 0
+        cum_pv += p * v; cum_v += v; cum_pv2 += p * p * v
+    vwap_t = cum_pv / cum_v if cum_v > 0 else last[4]
+    std = math.sqrt(max(0, (cum_pv2 / cum_v) - vwap_t ** 2)) if cum_v > 0 else 0
+
+    close_c = last[4]
+    vs_vwap = (close_c - vwap_t) / vwap_t * 100 if vwap_t else 0
+
+    # PVWAP: ngày gần nhất trước DATE_VN từ index_vwap_summary
+    pv_row = conn.execute('''
+        SELECT trade_date, vwap FROM index_vwap_summary
+        WHERE index_code=? AND trade_date < ?
+        ORDER BY trade_date DESC LIMIT 1
+    ''', (symbol, DATE_VN)).fetchone()
+    pv      = pv_row[1] if pv_row else None
+    pv_date = pv_row[0] if pv_row else None
+    vs_pv   = (close_c - pv) / pv * 100 if pv else None
+
+    # VWAP bounces
+    bounces = 0; was_below = False
+    for r in rows[-20:]:
+        c = r[4] or 0.0
+        if c <= 0: continue
+        if c < vwap_t * 0.998: was_below = True
+        elif was_below and c >= vwap_t * 0.998:
+            bounces += 1; was_below = False
+
+    # Hourly delta
+    hour_buckets = defaultdict(lambda: {'bv': 0, 'sv': 0, 'v': 0})
+    for r in rows:
+        t_str = str(r[0]).replace('T', ' ')
+        nums  = re.findall(r'\d+', t_str)
+        h_vn  = int(nums[3]) if len(nums) > 3 else 0
+        bk    = f'{h_vn:02d}h'
+        hour_buckets[bk]['bv'] += r[6]
+        hour_buckets[bk]['sv'] += r[7]
+        hour_buckets[bk]['v']  += r[5]
+
+    return {
+        'sym': symbol,        # tên sạch, không có ▼ suffix
+        'is_index': True,     # flag phân biệt index vs stock
+        'close': close_c, 'open': first[1],
+        'high': h_high, 'low': h_low,
+        'vwap': vwap_t, 'std': std,
+        'pvwap': pv, 'pvwap_date': pv_date,
+        'vs_vwap': vs_vwap, 'vs_pv': vs_pv,
+        'delta': total_d, 'total_vol': total_vol,
+        'buy_vol': total_bv, 'sell_vol': total_sv,
+        'side_cov': side_cov, 'ncandles': len(rows),
+        'bounces': bounces, 'signals': [],
+        'hist_deltas': [(pv_date, 0)] if pv_date else [],
+        'hour_buckets': dict(hour_buckets),
+    }
+
+
+
+def _summary_table_lines(results) -> list:
+    """Trả về list các dòng cho bảng tóm tắt (không print trực tiếp)."""
+    lines = []
+    lines.append(f"  {'SYM':<8} {'Close':>8} {'VWAP':>8} {'vsV%':>5}  {'PVWAP':>8} {'pvp%':>6}  {'Delta':>12}  {'Δ/V%':>6}  {'Vol(M)':>6}  {'Cov%':>5}  Signals")
+    lines.append(f"  {'─'*100}")
+    for r in results:
+        is_idx   = r.get('is_index', False)
+        sym_col  = f"{B}{C if is_idx else ''}{r['sym']:<8}{E}" if is_idx else f"  {B}{r['sym']:<5}{E}"
+        # index dùng prefix khác để căn đều
+        sym_pfx  = '' if is_idx else '  '
+        vs_v_col = f"{G if r['vs_vwap'] >= 0 else R}{r['vs_vwap']:>+4.1f}%{E}"
+        vs_p_str = f"{r['vs_pv']:>+5.2f}%" if r['vs_pv'] is not None else "   — "
+        is_lim   = r.get('is_limit', False)
+        d_col    = f"{Y}{'N/A (TRẦN/SÀN)':>12}{E}" if is_lim else f"{G if r['delta'] >= 0 else R}{r['delta']:>+12,}{E}"
+        pv_str   = f"{r['pvwap']:.2f}" if r['pvwap'] else "     —  "
+        sig_str  = ("⛔TRẦN" if r['close'] >= (r.get('pvwap') or r['close'])
+                    else "⛔SÀN") if is_lim else (
+            "  ".join(f"{s}({sc:.0f})" for s, _, sc, __ in r['signals'][:2]) or "-"
+        )
+        dv_pct   = r['delta'] / max(r['total_vol'], 1) * 100
+        dv_col   = f"{Y}{'  N/A':>6}{E}" if is_lim else f"{G if r['delta'] >= 0 else R}{dv_pct:>+6.1f}%{E}"
+        # Format: index rows dùng in đậm + có prefix 2 spaces cho cột sym rộng
+        if is_idx:
+            lines.append(
+                f"  {B}{C}{r['sym']:<8}{E}"
+                f" {r['close']:>8.2f} {r['vwap']:>8.2f} "
+                f"{vs_v_col}  {pv_str:>8} {vs_p_str}  {d_col}  "
+                f"{dv_col}  "
+                f"{r['total_vol']/1e6:>6.2f}M  {r['side_cov']:>5.1f}%  {sig_str}"
+            )
+        else:
+            lines.append(
+                f"  {B}{r['sym']:<8}{E}"
+                f" {r['close']:>8.2f} {r['vwap']:>8.2f} "
+                f"{vs_v_col}  {pv_str:>8} {vs_p_str}  {d_col}  "
+                f"{dv_col}  "
+                f"{r['total_vol']/1e6:>6.2f}M  {r['side_cov']:>5.1f}%  {sig_str}"
+            )
+    return lines
+
+
+def print_summary_table(results):
+    for line in _summary_table_lines(results):
+        print(line)
+
+
+def print_detail(r, show_hours=True):
+    pv = r['pvwap']
+    print(f"\n  ┌─ {B}{C}{r['sym']}{E} {'─'*50}")
+    print(f"  │  OHLC  : {r['open']:.2f} / {r['high']:.2f} / {r['low']:.2f} / {r['close']:.2f}")
+    print(f"  │  VWAP  : {r['vwap']:.2f}   ±1σ=[{r['vwap']-r['std']:.2f}, {r['vwap']+r['std']:.2f}]")
+    print(f"  │  PVWAP : {pv:.2f} ({r['pvwap_date']})" if pv else "  │  PVWAP : —")
+    if r.get('is_limit'):
+        print(f"  │  Delta : {Y}⛔ TRẦN/SÀN — delta không đáng tin ({r['limit_candles']} nến bị lọc){E}")
+    else:
+        print(f"  │  Delta : {r['delta']:+,}  buy={r['buy_vol']:,}  sell={r['sell_vol']:,}  side={r['side_cov']}%")
+    print(f"  │  Candles: {r['ncandles']}  |  VWAP bounces: {r['bounces']}")
+    if r['hist_deltas']:
+        parts = [f"{d}: {dlt:+,}" for d, dlt in r['hist_deltas'][:3]]
+        print(f"  │  History: " + "  |  ".join(parts))
+    if show_hours and r['hour_buckets']:
+        print(f"  │  Hourly delta:")
+        for bk in sorted(r['hour_buckets']):
+            b = r['hour_buckets'][bk]
+            d = b['bv'] - b['sv']
+            bar  = ('█' if d >= 0 else '░') * min(int(abs(d) / 20000), 20)
+            sign = '+' if d >= 0 else '-'
+            print(f"  │    {bk}: {b['v']/1e6:.2f}M  {d:>+10,}  {sign}{bar}")
+    if r['signals']:
+        print(f"  │  🔔 Signals:")
+        for sig, dir_, sc, det in r['signals']:
+            print(f"  │    {ICONS.get(sig,'•')} {sig:<22} [{dir_:<4}] score={sc:.0f}")
+            for k, v in list(det.items())[:3]:
+                print(f"  │       {k}: {v}")
+    else:
+        print(f"  │  ⚪ Không có signal đạt ngưỡng {MIN_SCORE}")
+    print(f"  └{'─'*53}")
+
+
+# ════════════════════════════════════════════════════════════════
+# RUN SCAN  (1 lần)
+# ════════════════════════════════════════════════════════════════
+
+def run_scan(args):
+    """Chạy một vòng scan. Được gọi trực tiếp hoặc từ realtime loop."""
+    DATE_VN = args.date or datetime.now(VN_TZ).strftime("%Y-%m-%d")
+
+    is_market = getattr(args, 'market', False)
+    if is_market:
+        # Load tất cả mã có data intraday hôm nay
+        db_open_vn = DATE_VN + 'T09:00:00'
+        db_now_vn  = datetime.now(VN_TZ).strftime('%Y-%m-%dT%H:%M:%S')
+        _conn = sqlite3.connect(DB); _conn.row_factory = sqlite3.Row
+        rows = _conn.execute("""
+            SELECT DISTINCT s.symbol
+            FROM stock_prices sp JOIN securities s ON s.security_id=sp.security_id
+            WHERE sp.interval='1m' AND sp.trade_time >= ? AND sp.trade_time <= ?
+            ORDER BY s.symbol
+        """, (db_open_vn, db_now_vn)).fetchall()
+        _conn.close()
+        watchlist = [r['symbol'] for r in rows]
+        # Luôn thêm VNINDEX đầu danh sách market (nếu chưa có)
+        if 'VNINDEX' not in watchlist:
+            watchlist = ['VNINDEX'] + watchlist
+        if not watchlist:
+            return [f"❌ Không có dữ liệu intraday hôm nay trong DB"], []
+    else:
+        watchlist = load_watchlist(list_name=args.name, db_path=DB)
+        if not watchlist:
+            return [f"❌ Watchlist '{args.name}' trống hoặc không tồn tại."], []
+
+    is_live = getattr(args, 'loop', False)
+    now_vn  = datetime.now(VN_TZ).strftime('%Y-%m-%d %H:%M:%S')
+    label_src = 'MARKET 📈' if is_market else f"list='{args.name}'"
+    label   = 'LIVE ⚡' if is_live else 'SCAN'
+
+    conn         = sqlite3.connect(DB); conn.row_factory = sqlite3.Row
+    session_open = _session_open_utc(DATE_VN)
+
+    mkt = conn.execute(
+        "SELECT SUM(COALESCE(volume,0)), SUM(COALESCE(buy_vol,0)+COALESCE(sell_vol,0)) "
+        "FROM stock_prices WHERE interval='1m' AND date(trade_time)=? AND volume>0",
+        (DATE_VN,)
+    ).fetchone()
+    mkt_cov        = round((mkt[1] or 0) * 100.0 / max(mkt[0] or 1, 1), 1)
+    delta_reliable = mkt_cov >= SIDE_QUALITY_GATE
+
+    eng = VWAPEngine(DB)
+    _ctx = _silent() if is_live else contextlib.nullcontext()
+    with _ctx:
+        all_snaps = {s.security_id: s for s in eng.compute_all(top_n=800, date_vn=DATE_VN)}
+    wh = WhaleHunter(DB)
+
+    # Invalidate pvwap cache nếu sang ngày mới
+    _cache_check(DATE_VN)
+
+    results = []
+    for sym in watchlist:
+        # ─ Chỉ số thị trường: đọc từ market_indices, không cần securities
+        if sym.upper() in MARKET_INDEX_CODES:
+            res = analyze_index_symbol(conn, sym.upper(), DATE_VN)
+        else:
+            # Cache security metadata (security_id, exchange) — không đổi trong session
+            if sym not in _SCAN_CACHE['meta']:
+                sec = conn.execute(
+                    "SELECT security_id, exchange FROM securities WHERE symbol=?", (sym,)
+                ).fetchone()
+                if sec:
+                    _SCAN_CACHE['meta'][sym] = (sec[0], sec[1] or 'UNKNOWN')
+            cached_meta = _SCAN_CACHE['meta'].get(sym)
+            if not cached_meta:
+                continue
+            sid, exchange = cached_meta
+            res = analyze_symbol(
+                conn, sid, sym, exchange,
+                DATE_VN, session_open, all_snaps, wh, delta_reliable
+            )
+        if res:
+            results.append(res)
+    conn.close()
+
+    # Filter / sort
+    display = results
+    if args.signals_only:
+        display = [r for r in results if r['signals']]
+
+    # Sort key
+    sort_by = getattr(args, 'sort', 'delta')
+    if sort_by == 'abs_delta':
+        sort_key = lambda r: -abs(r['delta'])
+    elif sort_by == 'symbol':
+        sort_key = lambda r: r['sym']
+    else:  # 'delta' — default: mã buy pressure mạnh nhất lên đầu
+        sort_key = lambda r: -r['delta']
+
+    display = sorted(display, key=sort_key)
+
+    # ── Pin các chỉ số thị trường (VNINDEX...) lên đầu bất kể sort ────────────
+    _index_rows = [r for r in display if r.get('is_index')]
+    _stock_rows  = [r for r in display if not r.get('is_index')]
+    display = _index_rows + _stock_rows
+
+    if args.top > 0:
+        # top áp dụng cho stock rows; index rows luôn hiện
+        display = _index_rows + _stock_rows[:args.top]
+
+    # ── Signal digest — build cột PHẢI (ASCII table, không emoji) ────
+    triggered = [(r['sym'], *sig, r['delta'], r['total_vol']) for r in results for sig in r['signals']]
+    triggered.sort(key=lambda x: -x[3])
+    DELTA_SIGNALS = {'HIDDEN_ACCUMULATION', 'DELTA_DIVERGENCE', 'VWAP_REJECTION', 'VWAP_RECLAIM'}
+    data_ok = delta_reliable
+
+    # Rút gọn tên signal để vừa cột
+    SIG_SHORT = {
+        'VWAP_BOUNCE':          'VWAP_BOUNCE',
+        'VWAP_REJECTION':       'VWAP_REJECT',
+        'VWAP_RECLAIM':         'VWAP_RECLAIM',
+        'PVWAP_SUPPORT_TEST':   'PVWAP_SUPP',
+        'HIDDEN_ACCUMULATION':  'HIDD_ACCUM',
+        'DELTA_DIVERGENCE':     'DELTA_DIV',
+    }
+    # ASCII direction tag (không dùng emoji ⬆️ vì chiếm 2 cols)
+    def _dir_tag(d): return f"{G}BUY {E}" if d == 'BUY' else f"{R}SELL{E}"
+
+    # Số signal = --top (khớp cột trái), hoặc tất cả
+    sig_limit = args.top if args.top > 0 else len(triggered)
+    sig_lines: list[str] = []
+
+    # Header cột phải — căn giống header cột trái
+    hdr_sep = '─' * 38
+    sig_lines.append(f"  {'SIGNAL DIGEST':^36}  sc >= {MIN_SCORE}")
+    sig_lines.append(f"  {hdr_sep}")
+    if not data_ok:
+        sig_lines.append(f"  {R}{B}⚠️  Coverage={mkt_cov}% [LOW-DATA]{E}")
+        sig_lines.append(f"  {R}   MASVN có thể bị FROZEN{E}")
+    if triggered:
+        for sym, sig, dir_, sc, det, delta, total_vol in triggered[:sig_limit]:
+            d_icon = '⬆️' if dir_ == 'BUY' else '⬇️'
+            is_delta_dep = sig in DELTA_SIGNALS
+            q_tag = f" {Y}[!]{E}" if (not data_ok and is_delta_dep) else ""
+            sig_lines.append(
+                f"  {ICONS.get(sig,'•')} {B}{sym:<5}{E} "
+                f"{d_icon} {sig:<22} sc={sc:.0f}{q_tag}"
+            )
+        if len(triggered) > sig_limit:
+            sig_lines.append(f"  … (+{len(triggered)-sig_limit} mã khác)")
+    else:
+        sig_lines.append("  ⚪ Không có signal nào kích hoạt")
+
+    # ── Cột TRÁI: VWAP table ─────────────────────────────────────────
+    lines: list[str] = []
+    lines.append(f"{'='*72}")
+    lines.append(f"  {B}{C}📋 VWAP WATCHLIST {label} — {now_vn}  ({len(watchlist)} mã, {label_src}){E}")
+    lines.append(f"{'='*72}")
+    lines.append(f"  Market Side Coverage: {mkt_cov}% | delta_reliable={delta_reliable}")
+
+    if display:
+        lines.append("")
+        # Đếm số dòng header trước khi summary table bắt đầu
+        # _summary_table_lines có col-header (dòng 0) + separator (dòng 1) + data...
+        # Vạch phân cách signal digest căn với dòng separator = left_pre_table + 1
+        left_pre_table = len(lines)
+        lines.extend(_summary_table_lines(display))
+        lines.append(f"  Tổng: {len(display)}/{len(results)} mã")
+    else:
+        left_pre_table = len(lines)
+
+    # ── Cột PHẢI: Signal Digest ────────────────────────────────────
+    # Pad đầu sig_lines để separator thẳng hàng với separator cột trái
+    pad_top = left_pre_table       # căn thẳng với col-header cột trái
+
+    DIR_COL = {'BUY': f"{G}BUY {E}", 'SELL': f"{R}SELL{E}"}
+
+    sig_limit = args.top if args.top > 0 else len(triggered)
+    sig_lines: list[str] = [''] * pad_top   # pad trống để căn hàng
+
+    # Header + separator thẳng hàng với col-header cột trái
+    sig_lines.append(f"  {'SYM':<5}  {'DIR':<4}  {'SIGNAL':<22}  {'SC':>3}  {'Delta':>8}  {'Δ/V%':>6}")
+    sig_lines.append(f"  {'─'*55}")
+
+    if not data_ok:
+        sig_lines.append(f"  {R}[!] Coverage={mkt_cov}% — LOW DATA{E}")
+
+    if triggered:
+        for sym, sig, dir_, sc, det, delta, total_vol in triggered[:sig_limit]:
+            q_mark = f"{Y}*{E}" if (not data_ok and sig in DELTA_SIGNALS) else ' '
+            dv_pct  = delta / max(total_vol, 1) * 100
+            d_abs   = delta / 1_000_000
+            dv_col  = f"{G if dv_pct >= 0 else R}{dv_pct:>+6.1f}%{E}"
+            d_col   = f"{G if delta >= 0 else R}{d_abs:>+7.2f}M{E}"
+            sig_lines.append(
+                f"  {B}{sym:<5}{E}  {DIR_COL.get(dir_, dir_)}  {sig:<22}  {sc:>3.0f}{q_mark} {d_col}  {dv_col}"
+            )
+        if len(triggered) > sig_limit:
+            sig_lines.append(f"  ... (+{len(triggered)-sig_limit} more)")
+    else:
+        sig_lines.append("  -- no signals --")
+
+    # Chi tiết chỉ in khi không phải live mode
+    if not args.no_detail and not is_live:
+        lines.append(f"{'─'*72}")
+        lines.append(f"  CHI TIẾT TỪNG MÃ:\n")
+        for r in display:
+            import io
+            buf = io.StringIO()
+            _old = sys.stdout; sys.stdout = buf
+            print_detail(r)
+            sys.stdout = _old
+            lines.extend(buf.getvalue().splitlines())
+
+    return lines, sig_lines
+
+
+
+# ════════════════════════════════════════════════════════════════
+# IN-PLACE RENDERER (live mode)
+# ════════════════════════════════════════════════════════════════
+
+import shutil
+
+import re as _re
+
+def _visual_len(s: str) -> int:
+    """
+    Tính độ rộng THỰC TẾ trên terminal:
+      - Strip ANSI escape codes (màu, bold...)
+      - Emoji và CJK ký tự chiếm 2 cột, đếm đúng là 2
+      - Variation selector U+FE0F (theo sau emoji) không chiếm cột, bỏ qua
+    """
+    clean = _re.sub(r'\x1b\[[0-9;]*m', '', s)  # strip ANSI
+    w = 0
+    for ch in clean:
+        cp = ord(ch)
+        if cp == 0xFE0F:   # variation selector — 0 width
+            pass
+        elif cp >= 0x2E80:  # CJK + emoji range → 2 cols
+            w += 2
+        else:
+            w += 1
+    return w
+
+# Keep old name as alias for compatibility
+_strip_ansi = lambda s: _re.sub(r'\x1b\[[0-9;]*m', '', s)
+
+def _render_clear(left: list, right: list, cycle: int, interval: int) -> None:
+    """
+    Ghép 2 cột side-by-side rồi in đè tại chỗ, không cuộn terminal.
+
+    Dùng escape CHA (\033[{N}G) để cột phải LUÔN bắt đầu tại cột N,
+    bất kể cột trái dài bao nhiêu — không bao giờ bị đẩy dòng.
+    """
+    term    = shutil.get_terminal_size(fallback=(160, 45))
+    term_w  = term.columns
+    term_h  = term.lines
+    max_rows = max(5, term_h - 3)
+
+    col_w   = term_w * 3 // 5     # cột trái chiếm 60% màn hình
+    right_x = col_w + 3           # cột phải bắt đầu tại 60%+3
+
+    left_vis  = left[:max_rows]
+    right_vis = right[:max_rows]
+    n_rows    = max(len(left_vis), len(right_vis))
+
+    sys.stdout.write("\033[2J\033[H")   # clear screen + cursor về (1,1)
+    for i in range(n_rows):
+        l_raw = left_vis[i]  if i < len(left_vis)  else ""
+        r_raw = right_vis[i] if i < len(right_vis) else ""
+        # In cột trái, sau đó dùng CHA để nhảy đến đúng cột right_x
+        # → cột phải không bao giờ bị lệch dù cột trái tràn
+        sys.stdout.write(l_raw + f"\033[{right_x}G" + r_raw + "\n")
+
+    sys.stdout.flush()
+
+    # Countdown đếm ngược
+    for remaining in range(interval, 0, -1):
+        now_vn = datetime.now(VN_TZ).strftime('%H:%M:%S')
+        sys.stdout.write(
+            f"\r  ⏱  [{now_vn}] Cycle #{cycle} — "
+            f"refresh trong {remaining:3d}s  (Ctrl+C để thoát)"
+        )
+        sys.stdout.flush()
+        time.sleep(1)
+    print()
+
+
+# ════════════════════════════════════════════════════════════════
+# MAIN
+# ════════════════════════════════════════════════════════════════
+
+def main():
+    parser = argparse.ArgumentParser(description="Batch VWAP Watchlist Scanner")
+    parser.add_argument("--date",         default=None,  help="Ngày phân tích YYYY-MM-DD (mặc định: hôm nay)")
+    parser.add_argument("--name",         default="vip", help="Tên watchlist trong DB (mặc định: vip)")
+    parser.add_argument("--market",       action="store_true", help="Quét toàn thị trường (tất cả mã có data hôm nay)")
+    parser.add_argument("--signals-only", action="store_true", help="Chỉ in mã có signal kích hoạt")
+    parser.add_argument("--top",          type=int, default=0, help="Top N mã sau khi sort")
+    parser.add_argument("--sort",         default="delta",
+                        choices=["delta", "abs_delta", "symbol"],
+                        help="Sắp xếp: delta (mua mạnh nhất lên đầu), abs_delta (biến động lớn nhất), symbol (A-Z). Mặc định: delta")
+    parser.add_argument("--no-detail",    action="store_true", help="Chỉ in bảng tóm tắt")
+    parser.add_argument("--loop",         action="store_true", help="Realtime mode: tự refresh liên tục (in-place, không cuộn)")
+    parser.add_argument("--interval",     type=int, default=60, help="Giây giữa mỗi refresh (mặc định: 60)")
+    args = parser.parse_args()
+
+    if args.loop:
+        cycle = 0
+        try:
+            while True:
+                cycle += 1
+                left, right = run_scan(args)
+                _render_clear(left, right, cycle, args.interval)
+        except KeyboardInterrupt:
+            print(f"\n\n  👋 Live mode đã dừng.\n")
+    else:
+        left, right = run_scan(args)
+        # Non-live: in cột trái, sau đó signal digest ở dưới
+        print("\n".join(left))
+        if right:
+            print("\n".join(right))
+
+
+if __name__ == "__main__":
+    main()
