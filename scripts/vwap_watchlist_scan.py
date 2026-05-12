@@ -305,7 +305,7 @@ def analyze_symbol(conn, sid, symbol, exchange, DATE_VN, session_open, all_snaps
 # INDEX ANALYSIS (đọc từ market_indices / index_vwap_summary)
 # ════════════════════════════════════════════════════════════════
 
-MARKET_INDEX_CODES = {'VNINDEX', 'VN30', 'VN100', 'HNX30'}
+MARKET_INDEX_CODES = {'VNINDEX', 'VN30', 'VN100', 'HNX30', 'NOVIN'}
 
 
 def analyze_index_symbol(conn, symbol: str, DATE_VN: str) -> dict | None:
@@ -521,9 +521,12 @@ def run_scan(args):
         """, (db_open_vn, db_now_vn)).fetchall()
         _conn.close()
         watchlist = [r['symbol'] for r in rows]
-        # Luôn thêm VNINDEX đầu danh sách market (nếu chưa có)
+        # Luôn pin VNINDEX + NOVIN đầu danh sách
         if 'VNINDEX' not in watchlist:
             watchlist = ['VNINDEX'] + watchlist
+        if 'NOVIN' not in watchlist:
+            idx = watchlist.index('VNINDEX') + 1
+            watchlist.insert(idx, 'NOVIN')
         if not watchlist:
             return [f"❌ Không có dữ liệu intraday hôm nay trong DB"], []
     else:
