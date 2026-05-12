@@ -533,6 +533,11 @@ def run_scan(args):
         watchlist = load_watchlist(list_name=args.name, db_path=DB)
         if not watchlist:
             return [f"❌ Watchlist '{args.name}' trống hoặc không tồn tại."], []
+        # Pin VNINDEX + NOVIN đầu mọi watchlist
+        if 'NOVIN' not in watchlist:
+            watchlist = ['NOVIN'] + watchlist
+        if 'VNINDEX' not in watchlist:
+            watchlist = ['VNINDEX'] + watchlist
 
     is_live = getattr(args, 'loop', False)
     now_vn  = datetime.now(VN_TZ).strftime('%Y-%m-%d %H:%M:%S')
