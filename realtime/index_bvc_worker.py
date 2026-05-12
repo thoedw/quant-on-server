@@ -260,34 +260,58 @@ def compute_novin(conn, date_vn, vin_weights, W_VIN):
     if not novin_bars:
         return 0
 
-    # BVC trên chính bars của noVININDEX:
-    # buy_vol=1 nếu close > open (bar tăng), sell_vol=1 nếu giảm → delta = ±1
-    # Tổng delta = (# bar tăng) − (# bar giảm) = directional tick count
+    # Lấy volume HOSE (trừ VIN group) theo từng bar 1m
+    # → NOVIN delta sẽ cùng đơn vị với VNINDEX delta (triệu cổ)
+    vin_ph   = ','.join('?' * len(VIN_GROUP))
+    vol_rows = conn.execute(f"""
+        SELECT sp.trade_time, SUM(sp.volume) as vol
+        FROM stock_prices sp
+        JOIN securities s ON s.security_id = sp.security_id
+        WHERE sp.interval = '1m' AND date(sp.trade_time) = ?
+          AND s.exchange = 'HOSE'
+          AND s.symbol NOT IN ({vin_ph})
+          AND sp.volume > 0
+        GROUP BY sp.trade_time
+    """, [date_vn] + VIN_GROUP).fetchall()
+    # VNINDEX v = khối lượng cổ phiếu (CP) → NOVIN dùng SUM(sp.volume) cùng đơn vị
+    # stock_prices dùng space separator, market_indices dùng 'T' → normalize
+    novin_vol_map = {r[0].replace(' ', 'T'): int(r[1]) for r in vol_rows}
+
+    # BVC với volume thực tế (HOSE trừ VIN) — delta cùng scale VNINDEX
     bvc_rows = []
     for tt, o, h, l, c in novin_bars:
-        bv, sv = _bvc(float(o), float(h), float(l), float(c), 1)
+        vol    = novin_vol_map.get(tt, 1)          # fallback=1 nếu chưa có dữ liệu
+        bv, sv = _bvc(float(o), float(h), float(l), float(c), vol)
         is_ato = 1 if tt[11:16] in ('09:15', '09:16') else 0
-        bvc_rows.append((tt, o, h, l, c, bv, sv, bv - sv, is_ato))
+        bvc_rows.append((tt, o, h, l, c, vol, bv, sv, bv - sv, is_ato))
 
     conn.executemany("""
         INSERT INTO market_indices
             (index_code, interval, trade_time, open, high, low, close,
              volume, buy_vol, sell_vol, delta, is_ato)
-        VALUES ('NOVIN', '1m', ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
+        VALUES ('NOVIN', '1m', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(index_code, interval, trade_time) DO UPDATE SET
             open=excluded.open, high=excluded.high,
             low=excluded.low,   close=excluded.close,
+            volume=excluded.volume,
             buy_vol=excluded.buy_vol, sell_vol=excluded.sell_vol,
             delta=excluded.delta
     """, bvc_rows)
 
-    # Ghi VWAP ngày hôm nay vào index_vwap_summary để ngày mai có PVWAP
-    closes      = [r[4] for r in novin_bars]
-    novin_vwap  = sum(closes) / len(closes)          # equal-weight (volume=1/bar)
-    variance    = sum((c - novin_vwap) ** 2 for c in closes) / max(len(closes), 1)
+    # Ghi VWAP ngày hôm nay vào index_vwap_summary — volume-weighted
+    cum_pv  = sum(r[4] * r[5] for r in bvc_rows)   # Σ(close × vol)
+    cum_vol = sum(r[5] for r in bvc_rows)
+    if cum_vol > 0:
+        novin_vwap = cum_pv / cum_vol
+        variance   = sum(r[5] * (r[4] - novin_vwap) ** 2 for r in bvc_rows) / cum_vol
+    else:
+        closes     = [r[4] for r in novin_bars]
+        novin_vwap = sum(closes) / len(closes)
+        variance   = sum((c - novin_vwap) ** 2 for c in closes) / max(len(closes), 1)
+        cum_vol    = len(novin_bars)
     novin_std   = math.sqrt(variance)
-    cum_bv      = sum(r[5] for r in bvc_rows)
-    cum_sv      = sum(r[6] for r in bvc_rows)
+    cum_bv      = sum(r[6] for r in bvc_rows)
+    cum_sv      = sum(r[7] for r in bvc_rows)
     cum_delta   = cum_bv - cum_sv
     conn.execute("""
         INSERT INTO index_vwap_summary
@@ -311,7 +335,7 @@ def compute_novin(conn, date_vn, vin_weights, W_VIN):
         round(novin_vwap, 4), round(novin_std, 4),
         round(novin_vwap + novin_std, 4),   round(novin_vwap - novin_std, 4),
         round(novin_vwap + 2*novin_std, 4), round(novin_vwap - 2*novin_std, 4),
-        len(novin_bars), cum_delta, cum_bv, cum_sv,
+        cum_vol, cum_delta, cum_bv, cum_sv,
         novin_bars[0][4],   # session_open = close nến 09:15
         novin_bars[-1][4],  # session_close = close nến cuối
     ))
@@ -325,7 +349,7 @@ def compute_novin(conn, date_vn, vin_weights, W_VIN):
         f'NOVIN: {len(novin_bars)} nến | '
         f'close={novin_last:.2f} ({novin_return_total:+.3%}) '
         f'vs VNINDEX={vni_bars[-1][1]:.2f} ({vni_return_total:+.3%}) '
-        f'| VIN drag={vin_drag:+.3%} | tick_delta={cum_delta:+d}'
+        f'| VIN drag={vin_drag:+.3%} | delta={cum_delta:+,} (buy={cum_bv:,} sell={cum_sv:,})'
     )
     return len(novin_bars)
 
