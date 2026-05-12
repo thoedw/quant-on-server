@@ -232,34 +232,21 @@ def run_bvc_imputer(
     t0 = time.time()
 
     # ── Build WHERE clause ──────────────────────────────────────
-    # base_parts: filter cho inner subquery (interval, volume, date)
-    # LAG() trong subquery cần toàn bộ bars cùng security + interval → không lọc buy_vol
-    base_parts = ["interval='1m'", "volume>0"]
+    count_parts = ["interval='1m'", "volume>0"]
     params: list = []
 
-    # missing_filter: chỉ lấy bars chưa classify — đặt ở outer query
-    missing_filter = (
-        "" if force else
-        "AND (buy_vol IS NULL OR buy_vol=0) AND (sell_vol IS NULL OR sell_vol=0)"
-    )
-
     if date_filter:
-        base_parts.append("date(trade_time)=?")
+        count_parts.append("date(trade_time)=?")
         params.append(date_filter)
     elif since_filter:
-        base_parts.append("date(trade_time)>=?")
+        count_parts.append("date(trade_time)>=?")
         params.append(since_filter)
     elif not all_history:
-        # Default: hôm nay
         today = datetime.now(VN_TZ).strftime("%Y-%m-%d")
-        base_parts.append("date(trade_time)=?")
+        count_parts.append("date(trade_time)=?")
         params.append(today)
         logger.info(f"Mặc định: chỉ xử lý hôm nay ({today})")
 
-    base_where = " AND ".join(base_parts)
-
-    # where_sql cho COUNT (dùng full filter để đếm đúng)
-    count_parts = list(base_parts)
     if not force:
         count_parts.append(
             "(buy_vol IS NULL OR buy_vol=0) AND (sell_vol IS NULL OR sell_vol=0)"
@@ -279,46 +266,65 @@ def run_bvc_imputer(
 
     if total_to_fix == 0:
         logger.info("✅ Không có bars nào cần xử lý.")
-        return {'total_found': 0, 'imputed': 0, 'skipped': 0, 'elapsed_sec': 0}
+        return {'total_found': 0, 'imputed': 0, 'preview': 0, 'skipped': 0, 'elapsed_sec': 0}
 
-    # ── Fetch với prev_close via LAG ────────────────────────────
-    # Inner subquery: LAG(close) PARTITION BY security_id để lấy close bar liền trước
-    # → prev_close đúng cho ATC bar: lấy được close của bar liên tục cuối (14:29)
-    # Outer query: lọc chỉ bars chưa classify (missing_filter)
-    rows = conn.execute(
-        f"""
-        SELECT rowid, open, high, low, close, volume, prev_close
-        FROM (
-            SELECT rowid, open, high, low, close, volume, buy_vol, sell_vol,
-                   LAG(close) OVER (
-                       PARTITION BY security_id ORDER BY trade_time
-                   ) AS prev_close
-            FROM stock_prices
-            WHERE {base_where}
-        )
-        WHERE 1=1 {missing_filter}
-        ORDER BY trade_time
-        """,
+    # ── Fetch per (security_id, date) ───────────────────────────
+    # Dùng per-security iteration thay vì LAG() flat để xử lý đúng ATC:
+    #   - LAG() blind lấy close của bar ngay trước — có thể là put-through bar
+    #     (HOSE 14:31-14:44: H=L=C, volume nhỏ) thay vì last continuous bar
+    #   - Per-security: track last_cont_close (close của bar cuối có H≠L range thật)
+    #     → ATC bar (H≈L) dùng last_cont_close, bỏ qua put-through bars ở giữa
+    pairs = conn.execute(
+        f"SELECT DISTINCT security_id, date(trade_time) FROM stock_prices "
+        f"WHERE {count_where} ORDER BY date(trade_time), security_id",
         params,
     ).fetchall()
 
     updates: list[tuple[int, int, int, int]] = []  # (buy_vol, sell_vol, delta, rowid)
     skipped = 0
 
-    for rowid, o, h, l, c, v, prev_c in rows:
-        if None in (o, h, l, c) or v <= 0:
-            skipped += 1
-            continue
-        try:
-            buy_vol, sell_vol = bvc_classify(
-                float(o), float(h), float(l), float(c), int(v),
-                float(prev_c) if prev_c is not None else None,
-            )
-            delta = buy_vol - sell_vol
-            updates.append((buy_vol, sell_vol, delta, rowid))
-        except Exception as exc:
-            logger.debug(f"BVC error rowid={rowid}: {exc}")
-            skipped += 1
+    for sec_id, dt in pairs:
+        # Kéo TOÀN BỘ bars 1m của mã này ngày này (kể cả đã classified)
+        # để last_cont_close tính đúng ngay cả khi bar liên tục cuối đã được classify
+        all_bars = conn.execute(
+            """
+            SELECT rowid, open, high, low, close, volume, buy_vol, sell_vol
+            FROM stock_prices
+            WHERE security_id=? AND interval='1m' AND date(trade_time)=?
+            ORDER BY trade_time ASC
+            """,
+            (sec_id, dt),
+        ).fetchall()
+
+        last_cont_close = None  # close của bar liên tục cuối (H≠L range thật)
+
+        for rowid, o, h, l, c, v, bv_db, sv_db in all_bars:
+            if None in (o, h, l, c):
+                continue
+            o, h, l, c = float(o), float(h), float(l), float(c)
+            bar_range = h - l
+
+            # Cập nhật last_cont_close khi gặp bar có range thật (liên tục hoặc doji có biên)
+            if bar_range >= 1e-6:
+                last_cont_close = c
+
+            # Chỉ classify bar chưa có side data (hoặc tất cả nếu force)
+            is_missing = (bv_db is None or bv_db == 0) and (sv_db is None or sv_db == 0)
+            if not (is_missing or force):
+                continue
+            if not v or v <= 0:
+                skipped += 1
+                continue
+
+            try:
+                # ATC/doji (H≈L): dùng last_cont_close → bỏ qua put-through bars ở giữa
+                # Continuous bars (H≠L): prev_close không dùng (Parkinson áp dụng)
+                prev_c = last_cont_close if bar_range < 1e-6 else None
+                buy_vol, sell_vol = bvc_classify(o, h, l, c, int(v), prev_c)
+                updates.append((buy_vol, sell_vol, buy_vol - sell_vol, rowid))
+            except Exception as exc:
+                logger.debug(f"BVC error rowid={rowid}: {exc}")
+                skipped += 1
 
     # ── Preview ────────────────────────────────────────────────
     logger.info(
