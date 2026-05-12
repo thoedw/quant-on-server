@@ -89,7 +89,8 @@ _SQRT_2LN2 = math.sqrt(2.0 * math.log(2.0))   # ≈ 1.1774
 
 
 def bvc_classify(open_: float, high: float, low: float,
-                 close: float, volume: int) -> tuple[int, int]:
+                 close: float, volume: int,
+                 prev_close: float = None) -> tuple[int, int]:
     """
     Bulk Volume Classification — Easley, López de Prado, O'Hara (2016).
 
@@ -118,13 +119,23 @@ def bvc_classify(open_: float, high: float, low: float,
     delta_p   = close - open_
 
     if bar_range < 1e-6:
-        # Nến doji / ATC: H ≈ L → không có directional information
-        # Gán 50/50 neutral (delta=0) thay vì bias về buy/sell, vì:
-        #   - Nến ATC (14:45): khớp lệnh định kỳ, không có aggressor bên nào
-        #   - Doji trong phiên: 2 bên cân bằng, delta_p=0 không cho thêm info
-        # Tránh sai lệch cum_delta và PVWAP tích lũy theo thời gian
-        buy_vol = volume // 2
-        return buy_vol, volume - buy_vol
+        # H≈L: Parkinson estimator không dùng được.
+        # Ưu tiên 1: within-bar direction (close - open) nếu open ≠ close
+        # Ưu tiên 2: cross-bar (close - prev_close) — ATC settlement vs last continuous
+        #   MASVN thường báo open=close=ATC settlement → delta_p=0, cần prev_close
+        # Ưu tiên 3: 50/50 khi không có đủ thông tin (ATO, doji thật)
+        ref = None
+        if abs(delta_p) >= 1e-6:
+            ref = delta_p
+        elif prev_close is not None:
+            ref = close - prev_close
+        if ref is None or abs(ref) < 1e-6:
+            buy_vol = volume // 2
+            return buy_vol, volume - buy_vol
+        elif ref > 0:
+            return volume, 0                    # ATC giá tăng → lực mua
+        else:
+            return 0, volume                    # ATC giá giảm → lực bán
 
     # Parkinson sigma (ước tính biến động nội tại của bar)
     sigma = bar_range / _SQRT_2LN2
@@ -221,33 +232,43 @@ def run_bvc_imputer(
     t0 = time.time()
 
     # ── Build WHERE clause ──────────────────────────────────────
-    where_parts = ["interval='1m'", "volume>0"]
+    # base_parts: filter cho inner subquery (interval, volume, date)
+    # LAG() trong subquery cần toàn bộ bars cùng security + interval → không lọc buy_vol
+    base_parts = ["interval='1m'", "volume>0"]
     params: list = []
 
-    if not force:
-        # Chỉ các bar chưa có side data
-        where_parts.append(
-            "(buy_vol IS NULL OR buy_vol=0) AND (sell_vol IS NULL OR sell_vol=0)"
-        )
+    # missing_filter: chỉ lấy bars chưa classify — đặt ở outer query
+    missing_filter = (
+        "" if force else
+        "AND (buy_vol IS NULL OR buy_vol=0) AND (sell_vol IS NULL OR sell_vol=0)"
+    )
 
     if date_filter:
-        where_parts.append("date(trade_time)=?")
+        base_parts.append("date(trade_time)=?")
         params.append(date_filter)
     elif since_filter:
-        where_parts.append("date(trade_time)>=?")
+        base_parts.append("date(trade_time)>=?")
         params.append(since_filter)
     elif not all_history:
         # Default: hôm nay
         today = datetime.now(VN_TZ).strftime("%Y-%m-%d")
-        where_parts.append("date(trade_time)=?")
+        base_parts.append("date(trade_time)=?")
         params.append(today)
         logger.info(f"Mặc định: chỉ xử lý hôm nay ({today})")
 
-    where_sql = " AND ".join(where_parts)
+    base_where = " AND ".join(base_parts)
+
+    # where_sql cho COUNT (dùng full filter để đếm đúng)
+    count_parts = list(base_parts)
+    if not force:
+        count_parts.append(
+            "(buy_vol IS NULL OR buy_vol=0) AND (sell_vol IS NULL OR sell_vol=0)"
+        )
+    count_where = " AND ".join(count_parts)
 
     # ── Count ──────────────────────────────────────────────────
     total_to_fix = conn.execute(
-        f"SELECT COUNT(*) FROM stock_prices WHERE {where_sql}", params
+        f"SELECT COUNT(*) FROM stock_prices WHERE {count_where}", params
     ).fetchone()[0]
 
     logger.info(
@@ -260,14 +281,23 @@ def run_bvc_imputer(
         logger.info("✅ Không có bars nào cần xử lý.")
         return {'total_found': 0, 'imputed': 0, 'skipped': 0, 'elapsed_sec': 0}
 
-    # ── Fetch ──────────────────────────────────────────────────
-    # Fetch rowid + OHLCV để tính BVC
+    # ── Fetch với prev_close via LAG ────────────────────────────
+    # Inner subquery: LAG(close) PARTITION BY security_id để lấy close bar liền trước
+    # → prev_close đúng cho ATC bar: lấy được close của bar liên tục cuối (14:29)
+    # Outer query: lọc chỉ bars chưa classify (missing_filter)
     rows = conn.execute(
         f"""
-        SELECT rowid, open, high, low, close, volume
-        FROM   stock_prices
-        WHERE  {where_sql}
-        ORDER  BY trade_time
+        SELECT rowid, open, high, low, close, volume, prev_close
+        FROM (
+            SELECT rowid, open, high, low, close, volume, buy_vol, sell_vol,
+                   LAG(close) OVER (
+                       PARTITION BY security_id ORDER BY trade_time
+                   ) AS prev_close
+            FROM stock_prices
+            WHERE {base_where}
+        )
+        WHERE 1=1 {missing_filter}
+        ORDER BY trade_time
         """,
         params,
     ).fetchall()
@@ -275,13 +305,14 @@ def run_bvc_imputer(
     updates: list[tuple[int, int, int, int]] = []  # (buy_vol, sell_vol, delta, rowid)
     skipped = 0
 
-    for rowid, o, h, l, c, v in rows:
+    for rowid, o, h, l, c, v, prev_c in rows:
         if None in (o, h, l, c) or v <= 0:
             skipped += 1
             continue
         try:
             buy_vol, sell_vol = bvc_classify(
-                float(o), float(h), float(l), float(c), int(v)
+                float(o), float(h), float(l), float(c), int(v),
+                float(prev_c) if prev_c is not None else None,
             )
             delta = buy_vol - sell_vol
             updates.append((buy_vol, sell_vol, delta, rowid))

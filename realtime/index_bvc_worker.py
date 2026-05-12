@@ -59,17 +59,25 @@ def _norm_cdf(z):
 _SQRT_2LN2 = math.sqrt(2.0 * math.log(2.0))
 
 
-def _bvc(o, h, l, c, v):
-    """BVC: phân loại volume thành buy/sell."""
+def _bvc(o, h, l, c, v, prev_c=None):
+    """BVC: phân loại volume thành buy/sell.
+
+    prev_c: close của bar liền trước — dùng cho ATC (H≈L, open=close=settlement).
+    Khi H≈L (ATC / doji):
+      1. Dùng within-bar direction (c - o) nếu open ≠ close
+      2. Dùng cross-bar direction (c - prev_c) nếu có prev_c → ATC vs last continuous
+      3. 50/50 nếu không có đủ thông tin
+    """
     if v <= 0:
         return 0, 0
     r  = h - l
     dp = c - o
     if r < 1e-6:
-        if abs(dp) < 1e-6:
+        ref = dp if abs(dp) >= 1e-6 else (c - prev_c if prev_c is not None else None)
+        if ref is None or abs(ref) < 1e-6:
             bv = v // 2
             return bv, v - bv
-        return (v, 0) if dp > 0 else (0, v)
+        return (v, 0) if ref > 0 else (0, v)
     z  = max(-4.0, min(4.0, dp / (r / _SQRT_2LN2)))
     bv = max(0, int(round(v * _norm_cdf(z))))
     return bv, max(0, v - bv)
@@ -278,12 +286,15 @@ def compute_novin(conn, date_vn, vin_weights, W_VIN):
     novin_vol_map = {r[0].replace(' ', 'T'): int(r[1]) for r in vol_rows}
 
     # BVC với volume thực tế (HOSE trừ VIN) — delta cùng scale VNINDEX
+    # prev_c truyền qua từng bar để xử lý đúng ATC (H≈L, close vs last continuous)
     bvc_rows = []
+    prev_c = None
     for tt, o, h, l, c in novin_bars:
         vol    = novin_vol_map.get(tt, 1)          # fallback=1 nếu chưa có dữ liệu
-        bv, sv = _bvc(float(o), float(h), float(l), float(c), vol)
+        bv, sv = _bvc(float(o), float(h), float(l), float(c), vol, prev_c)
         is_ato = 1 if tt[11:16] in ('09:15', '09:16') else 0
         bvc_rows.append((tt, o, h, l, c, vol, bv, sv, bv - sv, is_ato))
+        prev_c = float(c)
 
     conn.executemany("""
         INSERT INTO market_indices
@@ -413,18 +424,26 @@ def upsert_and_classify(conn, symbol, bars):
     """, [(symbol, b['trade_time'], b['open'], b['high'],
            b['low'], b['close'], b['volume']) for b in bars])
 
+    # LAG(close) trong subquery lấy close bar liền trước (bao gồm cả bar đã classified)
+    # → prev_close đúng cho ATC bar (14:30): lấy được close bar 14:29 liên tục
     rows = conn.execute("""
-        SELECT rowid, open, high, low, close, volume, trade_time
-        FROM market_indices
-        WHERE index_code=? AND interval='1m'
-          AND buy_vol=0 AND sell_vol=0 AND volume > 0
+        SELECT rowid, open, high, low, close, volume, trade_time, prev_close
+        FROM (
+            SELECT rowid, open, high, low, close, volume, trade_time,
+                   buy_vol, sell_vol,
+                   LAG(close) OVER (ORDER BY trade_time) AS prev_close
+            FROM market_indices
+            WHERE index_code=? AND interval='1m'
+        )
+        WHERE buy_vol=0 AND sell_vol=0 AND volume > 0
     """, (symbol,)).fetchall()
 
     updates = []
-    for rowid, o, h, l, c, v, tt in rows:
+    for rowid, o, h, l, c, v, tt, prev_c in rows:
         if None in (o, h, l, c):
             continue
-        bv, sv = _bvc(float(o), float(h), float(l), float(c), int(v))
+        bv, sv = _bvc(float(o), float(h), float(l), float(c), int(v),
+                      float(prev_c) if prev_c is not None else None)
         is_ato = 1 if tt[11:16] in ('09:15', '09:16') else 0
         updates.append((bv, sv, bv - sv, is_ato, rowid))
 
