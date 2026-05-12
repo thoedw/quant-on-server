@@ -260,25 +260,72 @@ def compute_novin(conn, date_vn, vin_weights, W_VIN):
     if not novin_bars:
         return 0
 
+    # BVC trên chính bars của noVININDEX:
+    # buy_vol=1 nếu close > open (bar tăng), sell_vol=1 nếu giảm → delta = ±1
+    # Tổng delta = (# bar tăng) − (# bar giảm) = directional tick count
+    bvc_rows = []
+    for tt, o, h, l, c in novin_bars:
+        bv, sv = _bvc(float(o), float(h), float(l), float(c), 1)
+        is_ato = 1 if tt[11:16] in ('09:15', '09:16') else 0
+        bvc_rows.append((tt, o, h, l, c, bv, sv, bv - sv, is_ato))
+
     conn.executemany("""
         INSERT INTO market_indices
             (index_code, interval, trade_time, open, high, low, close,
              volume, buy_vol, sell_vol, delta, is_ato)
-        VALUES ('NOVIN', '1m', ?, ?, ?, ?, ?, 1, 0, 0, 0, 0)
+        VALUES ('NOVIN', '1m', ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
         ON CONFLICT(index_code, interval, trade_time) DO UPDATE SET
             open=excluded.open, high=excluded.high,
-            low=excluded.low,   close=excluded.close
-    """, novin_bars)
+            low=excluded.low,   close=excluded.close,
+            buy_vol=excluded.buy_vol, sell_vol=excluded.sell_vol,
+            delta=excluded.delta
+    """, bvc_rows)
+
+    # Ghi VWAP ngày hôm nay vào index_vwap_summary để ngày mai có PVWAP
+    closes      = [r[4] for r in novin_bars]
+    novin_vwap  = sum(closes) / len(closes)          # equal-weight (volume=1/bar)
+    variance    = sum((c - novin_vwap) ** 2 for c in closes) / max(len(closes), 1)
+    novin_std   = math.sqrt(variance)
+    cum_bv      = sum(r[5] for r in bvc_rows)
+    cum_sv      = sum(r[6] for r in bvc_rows)
+    cum_delta   = cum_bv - cum_sv
+    conn.execute("""
+        INSERT INTO index_vwap_summary
+            (index_code, trade_date, vwap, vwap_std,
+             vwap_upper1, vwap_lower1, vwap_upper2, vwap_lower2,
+             cum_volume, cum_delta, buy_vol, sell_vol,
+             session_open, session_close)
+        VALUES ('NOVIN', ?, ?, ?,
+                ?, ?, ?, ?,
+                ?, ?, ?, ?,
+                ?, ?)
+        ON CONFLICT(index_code, trade_date) DO UPDATE SET
+            vwap=excluded.vwap, vwap_std=excluded.vwap_std,
+            vwap_upper1=excluded.vwap_upper1, vwap_lower1=excluded.vwap_lower1,
+            vwap_upper2=excluded.vwap_upper2, vwap_lower2=excluded.vwap_lower2,
+            cum_volume=excluded.cum_volume, cum_delta=excluded.cum_delta,
+            buy_vol=excluded.buy_vol, sell_vol=excluded.sell_vol,
+            session_close=excluded.session_close
+    """, (
+        date_vn,
+        round(novin_vwap, 4), round(novin_std, 4),
+        round(novin_vwap + novin_std, 4),   round(novin_vwap - novin_std, 4),
+        round(novin_vwap + 2*novin_std, 4), round(novin_vwap - 2*novin_std, 4),
+        len(novin_bars), cum_delta, cum_bv, cum_sv,
+        novin_bars[0][4],   # session_open = close nến 09:15
+        novin_bars[-1][4],  # session_close = close nến cuối
+    ))
     conn.commit()
 
-    novin_last   = novin_bars[-1][4]
+    novin_last         = novin_bars[-1][4]
     novin_return_total = novin_last / vni_open - 1.0
     vni_return_total   = vni_bars[-1][1] / vni_open - 1.0
+    vin_drag           = vni_return_total - novin_return_total * (1 - W_VIN)
     logger.info(
         f'NOVIN: {len(novin_bars)} nến | '
         f'close={novin_last:.2f} ({novin_return_total:+.3%}) '
         f'vs VNINDEX={vni_bars[-1][1]:.2f} ({vni_return_total:+.3%}) '
-        f'| VIN drag={novin_return_total - vni_return_total / (1-W_VIN) + novin_return_total:.3%}'
+        f'| VIN drag={vin_drag:+.3%} | tick_delta={cum_delta:+d}'
     )
     return len(novin_bars)
 
