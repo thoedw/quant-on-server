@@ -93,9 +93,14 @@ def load_today(conn: sqlite3.Connection, trade_date: str,
                dv.session_close AS close,
                dv.cum_volume    AS volume,
                dv.cum_delta,
-               COALESCE(dv.side_cov_pct, 0.0) AS side_cov
+               COALESCE(dv.side_cov_pct, 0.0) AS side_cov,
+               COALESCE(sp.pt_vol, 0)           AS pt_vol,
+               COALESCE(sp.foreign_buy_vol, 0)  AS nn_buy,
+               COALESCE(sp.foreign_sell_vol, 0) AS nn_sell
         FROM daily_vwap_summary dv
         JOIN securities s ON s.security_id = dv.security_id
+        LEFT JOIN stock_prices sp ON sp.security_id = dv.security_id
+          AND sp.interval = '1D' AND date(sp.trade_time) = dv.trade_date
         WHERE dv.trade_date = ?
           AND dv.cum_volume >= ?
           AND dv.vwap IS NOT NULL
@@ -301,12 +306,16 @@ def run_scan(trade_date: str, signal_filter: str = "all",
         if signal_filter in ("all", "reclaim"):
             sc, det = score_vwap_reclaim(row, history)
             if sc >= min_score:
-                reclaims.append({**row, "score": sc, "details": det, "trade_date": trade_date})
+                reclaims.append({**row, "score": sc, "details": det, "trade_date": trade_date,
+                                 "pt_vol": row.get("pt_vol", 0) or 0,
+                                 "nn_net": (row.get("nn_buy", 0) or 0) - (row.get("nn_sell", 0) or 0)})
 
         if signal_filter in ("all", "tight"):
             sc, det = score_band_tight(row, history)
             if sc >= min_score:
-                tights.append({**row, "score": sc, "details": det, "trade_date": trade_date})
+                tights.append({**row, "score": sc, "details": det, "trade_date": trade_date,
+                                "pt_vol": row.get("pt_vol", 0) or 0,
+                                "nn_net": (row.get("nn_buy", 0) or 0) - (row.get("nn_sell", 0) or 0)})
 
     conn.close()
 
@@ -359,6 +368,12 @@ def _print_signal_table(results: list[dict], title: str, cols: list[tuple]):
             db_str  = (f"{G}{W}{plain_d}{E}" if days_b >= 5
                        else f"{G}{plain_d}{E}" if days_b >= 3
                        else plain_d)
+            _R = "\033[91m"
+            _pt_k = r.get('pt_vol', 0) / 1e3
+            _nn_n = r.get('nn_net', 0)
+            _nn_c = G if _nn_n > 0 else (_R if _nn_n < 0 else '')
+            _nn_s = f"{_nn_c}{_nn_n/1e3:>+5.0f}K{E}" if _nn_n != 0 else "    — "
+            _pt_s = f"{_pt_k:>5.0f}K" if _pt_k > 0 else "    — "
             row_str = (
                 f"  {B}{W}{r['symbol']:<6}{E}  "
                 f"{score_c}{W}{r['score']:>5.0f}{E}  "
@@ -366,6 +381,7 @@ def _print_signal_table(results: list[dict], title: str, cols: list[tuple]):
                 f"{G}{vs_vwap:>+7.2f}%{E}  "
                 f"{G}{delta_r:>+6.1f}%{E}  "
                 f"{G}{_fmt_delta(delta):>9}{E}  "
+                f"{_pt_s}  {_nn_s}  "
                 f"{_pad_ansi(db_str, plain_d, 6)}  "
                 f"{vol_surge:>8}  "
                 f"{r['exchange']:<5}"
@@ -408,7 +424,7 @@ def print_all(reclaims: list[dict], tights: list[dict], trade_date: str):
             reclaims,
             "VWAP RECLAIM — Giá vượt lên trên VWAP",
             [("Mã",6),("Score",5),("Giá",7),("vs VWAP",8),
-             ("Δ/Vol",7),("Delta",9),("Days↓",6),("VolSurge",8),("EX",5)]
+             ("Δ/Vol",7),("Delta",9),("PT(K)",6),("NN Net",7),("Days↓",6),("VolSurge",8),("EX",5)]
         )
     else:
         print("\n  (Không có mã VWAP_RECLAIM)")

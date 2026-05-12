@@ -429,6 +429,97 @@ class CandleAccumulator:
 
 
 # ============================================================
+# PUT-THROUGH TRACKER
+# ============================================================
+
+class PutThroughTracker:
+    """
+    Lưu trữ in-memory snapshot put-through (thỏa thuận) lũy kế hôm nay per symbol.
+
+    Được cập nhật qua callback on_putthrough của DNSEProvider mỗi khi có lệnh
+    thỏa thuận mới từ exchange. Background task _pt_flush_worker flush dữ liệu
+    này xuống cột pt_vol của stock_prices[interval='1D'] mỗi 60 giây.
+
+    Lưu ý: avg_pt_price là giá bình quân lũy kế theo KRX — KHÔNG phải VWAP
+    của khớp lệnh liên tục. Hai khái niệm này tách biệt trong dự án.
+    """
+    def __init__(self):
+        self._data: dict[str, dict] = {}
+        self._lock = asyncio.Lock()
+
+    async def update(self, symbol: str, pt_vol: int, avg_pt_price: float,
+                     pt_val_tỷ: float, pt_count: int):
+        async with self._lock:
+            self._data[symbol] = {
+                'pt_vol':       pt_vol,
+                'avg_pt_price': avg_pt_price,
+                'pt_val_tỷ':    pt_val_tỷ,
+                'pt_count':     pt_count,
+            }
+
+    async def snapshot(self) -> dict[str, dict]:
+        async with self._lock:
+            return dict(self._data)
+
+    def reset(self):
+        self._data.clear()
+
+
+# ============================================================
+# FOREIGN TRADING TRACKER
+# ============================================================
+
+class ForeignTradingTracker:
+    """
+    Lưu trữ in-memory snapshot giao dịch nước ngoài lũy kế hôm nay per symbol.
+
+    Nhận cập nhật từ DNSEProvider qua topic trading_result_of_foreign_investor.
+    Tổng hợp cả G1 (khớp lệnh liên tục) và G4 (thỏa thuận) để có con số toàn phiên.
+
+    Background task _foreign_flush_worker flush vào cột foreign_buy_vol/foreign_sell_vol
+    của stock_prices[interval='1D'] mỗi 60 giây.
+
+    Nguồn dữ liệu: KRX broadcast — tích lũy từ đầu phiên, cập nhật real-time.
+    """
+    def __init__(self):
+        # _data[symbol] = {'G1': {...}, 'G4': {...}}
+        self._data: dict[str, dict[str, dict]] = {}
+        self._lock = asyncio.Lock()
+
+    async def update(self, symbol: str, board: str,
+                     buy_vol: int, buy_val: float,
+                     sell_vol: int, sell_val: float):
+        async with self._lock:
+            if symbol not in self._data:
+                self._data[symbol] = {}
+            self._data[symbol][board] = {
+                'buy_vol':  buy_vol,
+                'buy_val':  buy_val,
+                'sell_vol': sell_vol,
+                'sell_val': sell_val,
+            }
+
+    async def snapshot(self) -> dict[str, dict]:
+        """
+        Returns {symbol: {buy_vol, sell_vol, net_vol}} tổng hợp G1+G4.
+        """
+        async with self._lock:
+            result = {}
+            for sym, boards in self._data.items():
+                total_buy  = sum(b['buy_vol']  for b in boards.values())
+                total_sell = sum(b['sell_vol'] for b in boards.values())
+                result[sym] = {
+                    'buy_vol':  total_buy,
+                    'sell_vol': total_sell,
+                    'net_vol':  total_buy - total_sell,
+                }
+            return result
+
+    def reset(self):
+        self._data.clear()
+
+
+# ============================================================
 # SQLITE WRITER
 # ============================================================
 
@@ -448,10 +539,21 @@ class SQLiteWriter:
         self.sec_map = {row['symbol']: row['security_id'] for row in cur.fetchall()}
         logger.info(f"✅ SQLiteWriter: loaded {len(self.sec_map)} symbol mappings (WAL mode ON)")
 
+    # ON CONFLICT DO UPDATE thay vì INSERT OR REPLACE để giữ nguyên pt_vol
+    # đã được write_pt_vol() ghi vào từ put-through tracker.
     SQL_UPSERT = """
-        INSERT OR REPLACE INTO stock_prices
+        INSERT INTO stock_prices
             (security_id, interval, trade_time, open, high, low, close, volume, buy_vol, sell_vol, delta)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(security_id, interval, trade_time) DO UPDATE SET
+            open     = excluded.open,
+            high     = excluded.high,
+            low      = excluded.low,
+            close    = excluded.close,
+            volume   = excluded.volume,
+            buy_vol  = excluded.buy_vol,
+            sell_vol = excluded.sell_vol,
+            delta    = excluded.delta
     """
 
     def write(self, candles: list[tuple[str, str, CandleState]]) -> int:
@@ -531,6 +633,73 @@ class SQLiteWriter:
             }
         logger.info(f"🔥 Warm-Start: load {len(state)} khối 1D/1H đã flush hôm nay")
         return state
+
+    def write_pt_vol(self, pt_data: dict[str, int], trade_date: str) -> int:
+        """
+        Ghi pt_vol vào stock_prices[interval='1D'] cho từng mã.
+
+        Dùng UPSERT với trade_time = {trade_date}T09:00:00 (session open của 1D candle).
+        INSERT nếu row chưa tồn tại (1D chưa flush trong ngày), UPDATE nếu đã có.
+        ON CONFLICT chỉ set pt_vol — không ghi đè OHLCV đã flush bởi CandleAccumulator.
+
+        Parameters
+        ----------
+        pt_data    : {symbol: pt_vol_shares}
+        trade_date : 'YYYY-MM-DD'
+        """
+        session_open = f"{trade_date}T09:00:00"
+        rows = [
+            (self.sec_map[sym], session_open, pt_vol)
+            for sym, pt_vol in pt_data.items()
+            if sym in self.sec_map and pt_vol > 0
+        ]
+        if not rows:
+            return 0
+        conn = self.db.get_connection()
+        cur = conn.executemany("""
+            INSERT INTO stock_prices
+                (security_id, interval, trade_time,
+                 open, high, low, close, volume, buy_vol, sell_vol, delta, pt_vol)
+            VALUES (?, '1D', ?, 0, 0, 0, 0, 0, 0, 0, 0, ?)
+            ON CONFLICT(security_id, interval, trade_time) DO UPDATE SET
+                pt_vol = excluded.pt_vol
+        """, rows)
+        conn.commit()
+        return cur.rowcount
+
+    def write_foreign_vol(self, foreign_data: dict[str, dict], trade_date: str) -> int:
+        """
+        Ghi foreign_buy_vol / foreign_sell_vol vào stock_prices[interval='1D'] cho từng mã.
+
+        Dùng UPSERT với trade_time = {trade_date}T09:00:00 (session open).
+        ON CONFLICT chỉ set foreign columns — không ghi đè OHLCV.
+
+        Parameters
+        ----------
+        foreign_data : {symbol: {buy_vol, sell_vol, net_vol}}
+        trade_date   : 'YYYY-MM-DD'
+        """
+        session_open = f"{trade_date}T09:00:00"
+        rows = [
+            (self.sec_map[sym], session_open, d['buy_vol'], d['sell_vol'])
+            for sym, d in foreign_data.items()
+            if sym in self.sec_map and (d['buy_vol'] > 0 or d['sell_vol'] > 0)
+        ]
+        if not rows:
+            return 0
+        conn = self.db.get_connection()
+        cur = conn.executemany("""
+            INSERT INTO stock_prices
+                (security_id, interval, trade_time,
+                 open, high, low, close, volume, buy_vol, sell_vol, delta,
+                 foreign_buy_vol, foreign_sell_vol)
+            VALUES (?, '1D', ?, 0, 0, 0, 0, 0, 0, 0, 0, ?, ?)
+            ON CONFLICT(security_id, interval, trade_time) DO UPDATE SET
+                foreign_buy_vol  = excluded.foreign_buy_vol,
+                foreign_sell_vol = excluded.foreign_sell_vol
+        """, rows)
+        conn.commit()
+        return cur.rowcount
 
 
 # ============================================================
@@ -688,20 +857,22 @@ class RedisCandleCache:
 
 class IntradayEngine:
     def __init__(self):
-        self.accumulator   = CandleAccumulator()
-        self.writer        = SQLiteWriter(DB_PATH)
-        self.classifier    = TickClassifier()
-        self.vol_tracker   = VolumeTracker()
-        self.redis_tracker = RedisTickTracker()
+        self.accumulator      = CandleAccumulator()
+        self.writer           = SQLiteWriter(DB_PATH)
+        self.classifier       = TickClassifier()
+        self.vol_tracker      = VolumeTracker()
+        self.pt_tracker       = PutThroughTracker()
+        self.foreign_tracker  = ForeignTradingTracker()
+        self.redis_tracker    = RedisTickTracker()
         self.redis_cache   = RedisCandleCache(REDIS_HOST, REDIS_PORT)
-        
+
         # Thiết lập Router và phân vùng deduplication
         self.router = TickRouter(
             self.accumulator,
             self.classifier,
             self.redis_tracker
         )
-        
+
         self.providers: list[FeedProvider] = []
         self.masvn_manager: MASVNManager = None   # Khởi tạo sau khi có symbols
         self.flush_count   = 0
@@ -763,6 +934,67 @@ class IntradayEngine:
             except Exception as e:
                 logger.error(f"Lỗi Redis Sync: {e}")
 
+    async def _pt_flush_worker(self):
+        """
+        Background task: ghi pt_vol (khối lượng thỏa thuận) vào DB mỗi 60 giây.
+
+        Nguồn dữ liệu: PutThroughTracker nhận từ DNSEProvider qua topic
+        stockinfo/v1/roundlotputthrough — dữ liệu trực tiếp từ exchange KRX,
+        chính xác hơn phương pháp residual của ptvol_imputer.py.
+        """
+        while self._running:
+            await asyncio.sleep(60)
+            try:
+                snapshot = await self.pt_tracker.snapshot()
+                if not snapshot:
+                    continue
+                trade_date = datetime.now().strftime('%Y-%m-%d')
+                pt_data = {sym: d['pt_vol'] for sym, d in snapshot.items()}
+                written = await asyncio.to_thread(
+                    self.writer.write_pt_vol, pt_data, trade_date
+                )
+                if written:
+                    logger.info(
+                        f"📊 pt_vol flush: {written} mã | "
+                        + ", ".join(
+                            f"{s}={d['pt_vol']//10000:.0f}万"
+                            for s, d in list(snapshot.items())[:5]
+                        )
+                    )
+                else:
+                    logger.warning(f"📊 pt_vol flush: 0 rows written (tracker có {len(snapshot)} mã)")
+            except Exception as e:
+                logger.error(f"Lỗi pt_vol flush: {e}")
+
+    async def _foreign_flush_worker(self):
+        """
+        Background task: ghi foreign_buy_vol/foreign_sell_vol vào DB mỗi 60 giây.
+
+        Nguồn: KRX topic trading_result_of_foreign_investor — tích lũy từ đầu phiên.
+        Tổng hợp G1 (khớp lệnh liên tục) + G4 (thỏa thuận) trước khi ghi.
+        """
+        while self._running:
+            await asyncio.sleep(60)
+            try:
+                snapshot = await self.foreign_tracker.snapshot()
+                if not snapshot:
+                    continue
+                trade_date = datetime.now().strftime('%Y-%m-%d')
+                written = await asyncio.to_thread(
+                    self.writer.write_foreign_vol, snapshot, trade_date
+                )
+                if written:
+                    top5 = sorted(snapshot.items(),
+                                  key=lambda kv: abs(kv[1]['net_vol']), reverse=True)[:5]
+                    logger.debug(
+                        f"🌏 foreign flush: {written} mã | "
+                        + ", ".join(
+                            f"{s} net={d['net_vol']//1000:.0f}K"
+                            for s, d in top5
+                        )
+                    )
+            except Exception as e:
+                logger.error(f"Lỗi foreign_vol flush: {e}")
 
     async def run(self):
         """Main loop: Khởi động hệ thống Multi-Vendor Pricing Engine"""
@@ -782,8 +1014,27 @@ class IntradayEngine:
         logger.info(f"📊 Tìm thấy {len(all_symbols)} mã chứng khoán.")
 
         # Định cấu hình DNSE Provider
+        loop = asyncio.get_running_loop()
         dnse = DNSEProvider(self.vol_tracker)
         dnse.on_tick = self.router.route_tick
+        dnse.on_putthrough = lambda sym, data: asyncio.run_coroutine_threadsafe(
+            self.pt_tracker.update(
+                sym,
+                data['pt_vol'],
+                data['avg_pt_price'],
+                data['pt_val_tỷ'],
+                data['pt_count'],
+            ),
+            loop,
+        )
+        dnse.on_foreign_tick = lambda sym, board, data: asyncio.run_coroutine_threadsafe(
+            self.foreign_tracker.update(
+                sym, board,
+                data['buy_vol'], data['buy_val'],
+                data['sell_vol'], data['sell_val'],
+            ),
+            loop,
+        )
         self.providers.append(dnse)
 
         # Định cấu hình MASVN Manager (2 workers Active-Active cho Tier 1)
@@ -822,10 +1073,12 @@ class IntradayEngine:
         await self.masvn_manager.start()
 
         # 3. Start background loops
-        flush_task = asyncio.ensure_future(self._flush_worker())
-        redis_sync_task = asyncio.ensure_future(self._redis_sync_worker())
-        redis_flush_task = asyncio.ensure_future(self.redis_tracker.flush_batch_loop())
+        flush_task          = asyncio.ensure_future(self._flush_worker())
+        redis_sync_task     = asyncio.ensure_future(self._redis_sync_worker())
+        redis_flush_task    = asyncio.ensure_future(self.redis_tracker.flush_batch_loop())
         router_cleanup_task = asyncio.ensure_future(self.router.dedup_cleanup_loop())
+        pt_flush_task       = asyncio.ensure_future(self._pt_flush_worker())
+        foreign_flush_task  = asyncio.ensure_future(self._foreign_flush_worker())
         
         # 5. Heartbeat Monitor Loop
         try:
@@ -857,6 +1110,8 @@ class IntradayEngine:
             redis_sync_task.cancel()
             redis_flush_task.cancel()
             router_cleanup_task.cancel()
+            pt_flush_task.cancel()
+            foreign_flush_task.cancel()
 
             logger.info("Dừng MASVN Manager...")
             await self.masvn_manager.stop()

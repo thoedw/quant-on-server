@@ -115,6 +115,36 @@ def _visible_len(s: str) -> int:
 
 
 # ════════════════════════════════════════════════════════════════
+
+# ════════════════════════════════════════════════════════════════
+# PT_VOL + NN DATA — Lấy từ stock_prices 1D một lần / ngày
+# ════════════════════════════════════════════════════════════════
+_PT_NN_CACHE: dict = {}   # DATE_VN → {symbol: {pt_vol, nn_net, nn_buy, nn_sell}}
+
+def _fetch_pt_nn_1d(conn, DATE_VN: str) -> dict:
+    """Bulk-fetch pt_vol + foreign_buy/sell từ 1D bars cho ngày DATE_VN.
+    Trả về dict symbol → {pt_vol, nn_buy, nn_sell, nn_net}.
+    Cache theo ngày — không refetch trong cùng phiên.
+    """
+    if DATE_VN in _PT_NN_CACHE:
+        return _PT_NN_CACHE[DATE_VN]
+    rows = conn.execute("""
+        SELECT s.symbol,
+               COALESCE(sp.pt_vol, 0)           AS pt_vol,
+               COALESCE(sp.foreign_buy_vol, 0)  AS nn_buy,
+               COALESCE(sp.foreign_sell_vol, 0) AS nn_sell
+        FROM stock_prices sp
+        JOIN securities s ON s.security_id = sp.security_id
+        WHERE sp.interval = '1D'
+          AND date(sp.trade_time) = ?
+    """, (DATE_VN,)).fetchall()
+    result = {}
+    for r in rows:
+        sym, pt, nb, ns = r[0], r[1] or 0, r[2] or 0, r[3] or 0
+        result[sym] = {'pt_vol': pt, 'nn_buy': nb, 'nn_sell': ns, 'nn_net': nb - ns}
+    _PT_NN_CACHE[DATE_VN] = result
+    return result
+
 # ANALYSIS CORE
 # ════════════════════════════════════════════════════════════════
 
@@ -257,6 +287,7 @@ def analyze_symbol(conn, sid, symbol, exchange, DATE_VN, session_open, all_snaps
         'hour_buckets': dict(hour_buckets),
         'is_limit': is_limit,          # True nếu mã kịch trần/sàn
         'limit_candles': limit_candles, # Số nến bị lọc
+        'pt_vol': 0, 'nn_buy': 0, 'nn_sell': 0, 'nn_net': 0,  # sẽ merge sau
     }
 
 
@@ -355,7 +386,7 @@ def analyze_index_symbol(conn, symbol: str, DATE_VN: str) -> dict | None:
 def _summary_table_lines(results) -> list:
     """Trả về list các dòng cho bảng tóm tắt (không print trực tiếp)."""
     lines = []
-    lines.append(f"  {'SYM':<8} {'Close':>8} {'VWAP':>8} {'vsV%':>5}  {'PVWAP':>8} {'pvp%':>6}  {'Delta':>12}  {'Δ/V%':>6}  {'Vol(M)':>6}  {'Cov%':>5}  Signals")
+    lines.append(f"  {'SYM':<8} {'Close':>8} {'VWAP':>8} {'vsV%':>5}  {'PVWAP':>8} {'pvp%':>6}  {'Delta':>12}  {'Δ/V%':>6}  {'Vol(M)':>6}  {'PT(M)':>6}  {'NN Net':>8}  {'Cov%':>5}  Signals")
     lines.append(f"  {'─'*100}")
     for r in results:
         is_idx   = r.get('is_index', False)
@@ -380,15 +411,20 @@ def _summary_table_lines(results) -> list:
                 f" {r['close']:>8.2f} {r['vwap']:>8.2f} "
                 f"{vs_v_col}  {pv_str:>8} {vs_p_str}  {d_col}  "
                 f"{dv_col}  "
-                f"{r['total_vol']/1e6:>6.2f}M  {r['side_cov']:>5.1f}%  {sig_str}"
+                f"{r['total_vol']/1e6:>6.2f}M       —       —    {r['side_cov']:>5.1f}%  {sig_str}"
             )
         else:
+            pt_m   = r.get('pt_vol', 0) / 1e6
+            nn_net = r.get('nn_net', 0)
+            nn_col = (f"{G}{nn_net/1e3:>+6.0f}K{E}" if nn_net > 0 else
+                      f"{R}{nn_net/1e3:>+6.0f}K{E}" if nn_net < 0 else "      —  ")
+            pt_col = f"{pt_m:>6.2f}M" if pt_m > 0 else "     — "
             lines.append(
                 f"  {B}{r['sym']:<8}{E}"
                 f" {r['close']:>8.2f} {r['vwap']:>8.2f} "
                 f"{vs_v_col}  {pv_str:>8} {vs_p_str}  {d_col}  "
                 f"{dv_col}  "
-                f"{r['total_vol']/1e6:>6.2f}M  {r['side_cov']:>5.1f}%  {sig_str}"
+                f"{r['total_vol']/1e6:>6.2f}M  {pt_col}  {nn_col}  {r['side_cov']:>5.1f}%  {sig_str}"
             )
     return lines
 
@@ -408,6 +444,11 @@ def print_detail(r, show_hours=True):
         print(f"  │  Delta : {Y}⛔ TRẦN/SÀN — delta không đáng tin ({r['limit_candles']} nến bị lọc){E}")
     else:
         print(f"  │  Delta : {r['delta']:+,}  buy={r['buy_vol']:,}  sell={r['sell_vol']:,}  side={r['side_cov']}%")
+    # PT Vol + NN
+    pt = r.get('pt_vol', 0); nn_b = r.get('nn_buy', 0); nn_s = r.get('nn_sell', 0); nn_n = r.get('nn_net', 0)
+    if pt > 0 or nn_b > 0 or nn_s > 0:
+        nn_tag = f"{G}+{nn_n/1e3:.0f}K{E}" if nn_n > 0 else (f"{R}{nn_n/1e3:.0f}K{E}" if nn_n < 0 else "—")
+        print(f"  │  Block : PT={pt/1e3:.0f}K CP  | NN buy={nn_b/1e3:.0f}K  sell={nn_s/1e3:.0f}K  net={nn_tag}")
     print(f"  │  Candles: {r['ncandles']}  |  VWAP bounces: {r['bounces']}")
     if r['hist_deltas']:
         parts = [f"{d}: {dlt:+,}" for d, dlt in r['hist_deltas'][:3]]
@@ -511,6 +552,16 @@ def run_scan(args):
             )
         if res:
             results.append(res)
+    # PT/NN data cập nhật realtime trong phiên → không dùng cache cũ
+    _PT_NN_CACHE.pop(DATE_VN, None)
+    pt_nn = _fetch_pt_nn_1d(conn, DATE_VN)
+    for r in results:
+        nn_data = pt_nn.get(r.get('sym', ''), {})
+        r['pt_vol']  = nn_data.get('pt_vol', 0)
+        r['nn_buy']  = nn_data.get('nn_buy', 0)
+        r['nn_sell'] = nn_data.get('nn_sell', 0)
+        r['nn_net']  = nn_data.get('nn_net', 0)
+
     conn.close()
 
     # Filter / sort

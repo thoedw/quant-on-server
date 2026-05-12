@@ -77,9 +77,14 @@ def load_daily_vwap(conn: sqlite3.Connection, trade_date: str) -> list[dict]:
             dv.cum_volume     AS volume,
             dv.cum_delta,
             COALESCE(dv.side_cov_pct, 0.0) AS side_cov,
-            s.exchange
+            s.exchange,
+            COALESCE(sp.pt_vol, 0)           AS pt_vol,
+            COALESCE(sp.foreign_buy_vol, 0)  AS nn_buy,
+            COALESCE(sp.foreign_sell_vol, 0) AS nn_sell
         FROM daily_vwap_summary dv
         JOIN securities s ON s.security_id = dv.security_id
+        LEFT JOIN stock_prices sp ON sp.security_id = dv.security_id
+          AND sp.interval = '1D' AND date(sp.trade_time) = dv.trade_date
         WHERE dv.trade_date = ?
           AND dv.cum_volume >= ?
           AND dv.vwap IS NOT NULL
@@ -250,6 +255,10 @@ def run_scan(trade_date: str, min_score: float = MIN_SCORE, top_n: int = 0) -> l
                 "score":      score,
                 "details":    details,
                 "trade_date": trade_date,   # resolved date
+                "pt_vol":     row["pt_vol"]  if "pt_vol"  in row.keys() else 0,
+                "nn_buy":     row["nn_buy"]  if "nn_buy"  in row.keys() else 0,
+                "nn_sell":    row["nn_sell"] if "nn_sell" in row.keys() else 0,
+                "nn_net":     (row["nn_buy"] - row["nn_sell"]) if "nn_buy" in row.keys() else 0,
             })
 
     conn.close()
@@ -343,10 +352,10 @@ def _fmt_delta(v: int) -> str:
 
 
 def _print_tier(results: list[dict], title: str):
-    G = "\033[92m"; Y = "\033[93m"; B = "\033[94m"; E = "\033[0m"; W = "\033[1m"
+    G = "\033[92m"; R = "\033[91m"; Y = "\033[93m"; B = "\033[94m"; E = "\033[0m"; W = "\033[1m"
     HDR  = "\033[1;97m"   # bright white bold cho header
 
-    COL = f"  {HDR}{'Mã':<6} {'Giá':>7}  {'vs VWAP':>8}  {'Δ/Vol':>7}  {'Delta':>9}  {'Streak':<9} {'Vol Surge':>9}  {'Score':>5}{E}"
+    COL = f"  {HDR}{'Mã':<6} {'Giá':>7}  {'vs VWAP':>8}  {'Δ/Vol':>7}  {'Delta':>9}  {'PT(K)':>7}  {'NN Net':>8}  {'Streak':<9} {'Vol Surge':>9}  {'Score':>5}{E}"
     SEP = f"  {HDR}{'─'*74}{E}"
 
     print(f"\n  {W}🏆 {title}{E}")
@@ -377,12 +386,18 @@ def _print_tier(results: list[dict], title: str):
         # Score color
         score_c = G if r["score"] >= 80 else Y
 
+        pt_k   = r.get('pt_vol', 0) / 1e3
+        nn_net = r.get('nn_net', 0)
+        nn_c   = G if nn_net > 0 else (R if nn_net < 0 else '')
+        nn_str = f"{nn_c}{nn_net/1e3:>+6.0f}K{E}" if nn_net != 0 else "      — "
+        pt_str = f"{pt_k:>6.0f}K" if pt_k > 0 else "      — "
         print(
             f"  {B}{W}{r['symbol']:<6}{E} "
             f"{r['close']:>7.2f}  "
             f"{vs_vwap_pct:>+7.2f}%  "
             f"{G}{delta_ratio:>+6.1f}%{E}  "
             f"{G}{_fmt_delta(r['cum_delta']):>9}{E}  "
+            f"{pt_str}  {nn_str}  "
             f"{_pad_ansi(streak_str, plain_streak, 9)}"
             f"{vol_surge:>9}  "
             f"{score_c}{W}{r['score']:>5.0f}{E}"
