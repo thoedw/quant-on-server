@@ -98,6 +98,8 @@ class EmailAlerter:
         "VWAP_REJECTION"     : "🔴",
         "PVWAP_SUPPORT_TEST" : "🎯",
         "VWAP_BOUNCE"        : "🔁",
+        "PT_ACCUMULATION"    : "🏦",
+        "PT_DUMPING"         : "🏚️",
     }
     COLORS = {
         "BUY" : "#00c853",  # xanh lá
@@ -230,6 +232,8 @@ class TelegramAlerter:
         "VWAP_REJECTION"     : "🔴",
         "PVWAP_SUPPORT_TEST" : "🎯",
         "VWAP_BOUNCE"        : "🔁",
+        "PT_ACCUMULATION"    : "🏦",
+        "PT_DUMPING"         : "🏚️",
     }
 
     def __init__(self):
@@ -789,6 +793,109 @@ def score_vwap_bounce(
     return min(score, 100.0), details
 
 
+PT_RATIO_MIN     = 0.10   # 10% — pt_vol phải chiếm ≥ 10% tổng vol mới có ý nghĩa
+PT_RATIO_STRONG  = 0.25   # 25% — tín hiệu block trade rất mạnh
+
+
+def score_pt_accumulation(
+    snap: dict, delta_reliable: bool = True
+) -> tuple[float, dict]:
+    """
+    🏦 PT_ACCUMULATION: Tổ chức mua thỏa thuận với giá cao hơn VWAP.
+    avg_pt_price > vwap → premium bỏ ra = sẵn sàng trả giá cao để tích lũy.
+
+    Scoring:
+      Base 50   : avg_pt_price > vwap AND pt_ratio >= PT_RATIO_MIN
+      Premium   : +20 nếu premium > 1%, +10 nếu > 0.3%
+      PT Ratio  : +15 nếu pt_ratio >= PT_RATIO_STRONG (≥ 25%)
+      Cum Delta : +15 nếu delta_reliable và dương (lệnh khớp cũng mua)
+    """
+    pt_vol      = snap.get("pt_vol", 0)
+    avg_pt      = snap.get("avg_pt_price", 0.0)
+    pt_ratio    = snap.get("pt_ratio", 0.0)
+    vwap        = snap["vwap"]
+    cum_vol     = snap["cum_volume"]
+
+    if pt_vol == 0 or avg_pt <= 0 or pt_ratio < PT_RATIO_MIN:
+        return 0.0, {}
+    if avg_pt <= vwap:
+        return 0.0, {}  # Không phải premium
+    if cum_vol < MIN_CUM_VOL:
+        return 0.0, {}
+
+    premium = (avg_pt - vwap) / vwap
+    details = {
+        "avg_pt_price": f"{avg_pt:.3f}",
+        "vwap"        : f"{vwap:.3f}",
+        "premium_pct" : round(premium * 100, 2),
+        "pt_vol"      : f"{pt_vol:,}",
+        "pt_ratio_pct": round(pt_ratio * 100, 1),
+    }
+
+    score = 50.0
+    if   premium > 0.01: score += 20
+    elif premium > 0.003: score += 10
+
+    if pt_ratio >= PT_RATIO_STRONG:
+        score += 15
+        details["strong_block"] = True
+
+    if delta_reliable and snap["cum_delta"] > 0:
+        score += 15
+        details["cum_delta"] = f"+{snap['cum_delta']:,}"
+
+    return min(score, 100.0), details
+
+
+def score_pt_dumping(snap: dict) -> tuple[float, dict]:
+    """
+    🏚️ PT_DUMPING: Tổ chức xả thỏa thuận với giá thấp hơn VWAP.
+    avg_pt_price < vwap → chấp nhận discount để thoát hàng nhanh.
+
+    Scoring:
+      Base 50   : avg_pt_price < vwap AND pt_ratio >= PT_RATIO_MIN
+      Discount  : +20 nếu discount > 1%, +10 nếu > 0.3%
+      PT Ratio  : +15 nếu pt_ratio >= PT_RATIO_STRONG
+      Above VWAP: +15 nếu giá khớp lệnh vẫn trên VWAP (xả nhưng che giấu)
+    """
+    pt_vol   = snap.get("pt_vol", 0)
+    avg_pt   = snap.get("avg_pt_price", 0.0)
+    pt_ratio = snap.get("pt_ratio", 0.0)
+    vwap     = snap["vwap"]
+    cum_vol  = snap["cum_volume"]
+
+    if pt_vol == 0 or avg_pt <= 0 or pt_ratio < PT_RATIO_MIN:
+        return 0.0, {}
+    if avg_pt >= vwap:
+        return 0.0, {}  # Không phải discount
+    if cum_vol < MIN_CUM_VOL:
+        return 0.0, {}
+
+    discount = (vwap - avg_pt) / vwap
+    details  = {
+        "avg_pt_price": f"{avg_pt:.3f}",
+        "vwap"        : f"{vwap:.3f}",
+        "discount_pct": round(discount * 100, 2),
+        "pt_vol"      : f"{pt_vol:,}",
+        "pt_ratio_pct": round(pt_ratio * 100, 1),
+    }
+
+    score = 50.0
+    if   discount > 0.01:  score += 20
+    elif discount > 0.003: score += 10
+
+    if pt_ratio >= PT_RATIO_STRONG:
+        score += 15
+        details["strong_block"] = True
+
+    # Giá khớp lệnh còn trên VWAP nhưng thỏa thuận dưới → cá mập che giấu bán
+    if snap["last_close"] > vwap:
+        score += 15
+        details["hidden_dump"] = "Giá lệnh trên VWAP nhưng PT dưới — dump ẩn"
+
+    return min(score, 100.0), details
+
+
 # ============================================================
 # MAIN SCANNER
 # ============================================================
@@ -953,6 +1060,10 @@ class WhaleHunter:
             "cum_volume"   : s.cum_volume,
             "cum_delta"    : s.cum_delta,
             "last_close"   : s.last_close,
+            # Put-through fields
+            "pt_vol"       : s.pt_vol,
+            "avg_pt_price" : s.avg_pt_price,
+            "pt_ratio"     : s.pt_ratio,
         } for s in snapshots}
 
         # BƯỚC 2: Quét signal cho từng mã
@@ -1008,6 +1119,16 @@ class WhaleHunter:
             if s6 >= MIN_SCORE:
                 found_signals.append(("VWAP_BOUNCE", "BUY", s6, d6))
 
+            # Signal 7: PT_ACCUMULATION (thỏa thuận premium > VWAP)
+            s7, d7 = score_pt_accumulation(snap, delta_reliable)
+            if s7 >= MIN_SCORE:
+                found_signals.append(("PT_ACCUMULATION", "BUY", s7, d7))
+
+            # Signal 8: PT_DUMPING (thỏa thuận discount < VWAP)
+            s8, d8 = score_pt_dumping(snap)
+            if s8 >= MIN_SCORE:
+                found_signals.append(("PT_DUMPING", "SELL", s8, d8))
+
             # Lưu và thu thập
             for sig_type, direction, score, details in found_signals:
                 saved = self._save_signal(
@@ -1062,6 +1183,8 @@ class WhaleHunter:
             "VWAP_REJECTION"     : "🔴",
             "PVWAP_SUPPORT_TEST" : "🎯",
             "VWAP_BOUNCE"        : "🔁",
+            "PT_ACCUMULATION"    : "🏦",
+            "PT_DUMPING"         : "🏚️",
         }
 
         for sig in sorted(signals, key=lambda x: -x["score"]):

@@ -634,24 +634,24 @@ class SQLiteWriter:
         logger.info(f"🔥 Warm-Start: load {len(state)} khối 1D/1H đã flush hôm nay")
         return state
 
-    def write_pt_vol(self, pt_data: dict[str, int], trade_date: str) -> int:
+    def write_pt_vol(self, pt_data: dict[str, dict], trade_date: str) -> int:
         """
-        Ghi pt_vol vào stock_prices[interval='1D'] cho từng mã.
+        Ghi pt_vol + avg_pt_price vào stock_prices[interval='1D'] cho từng mã.
 
         Dùng UPSERT với trade_time = {trade_date}T09:00:00 (session open của 1D candle).
         INSERT nếu row chưa tồn tại (1D chưa flush trong ngày), UPDATE nếu đã có.
-        ON CONFLICT chỉ set pt_vol — không ghi đè OHLCV đã flush bởi CandleAccumulator.
+        ON CONFLICT chỉ set pt_vol/avg_pt_price — không ghi đè OHLCV.
 
         Parameters
         ----------
-        pt_data    : {symbol: pt_vol_shares}
+        pt_data    : {symbol: {pt_vol, avg_pt_price}}
         trade_date : 'YYYY-MM-DD'
         """
         session_open = f"{trade_date}T09:00:00"
         rows = [
-            (self.sec_map[sym], session_open, pt_vol)
-            for sym, pt_vol in pt_data.items()
-            if sym in self.sec_map and pt_vol > 0
+            (self.sec_map[sym], session_open, d['pt_vol'], d['avg_pt_price'])
+            for sym, d in pt_data.items()
+            if sym in self.sec_map and d.get('pt_vol', 0) > 0
         ]
         if not rows:
             return 0
@@ -659,10 +659,12 @@ class SQLiteWriter:
         cur = conn.executemany("""
             INSERT INTO stock_prices
                 (security_id, interval, trade_time,
-                 open, high, low, close, volume, buy_vol, sell_vol, delta, pt_vol)
-            VALUES (?, '1D', ?, 0, 0, 0, 0, 0, 0, 0, 0, ?)
+                 open, high, low, close, volume, buy_vol, sell_vol, delta,
+                 pt_vol, avg_pt_price)
+            VALUES (?, '1D', ?, 0, 0, 0, 0, 0, 0, 0, 0, ?, ?)
             ON CONFLICT(security_id, interval, trade_time) DO UPDATE SET
-                pt_vol = excluded.pt_vol
+                pt_vol      = excluded.pt_vol,
+                avg_pt_price = excluded.avg_pt_price
         """, rows)
         conn.commit()
         return cur.rowcount
@@ -949,7 +951,10 @@ class IntradayEngine:
                 if not snapshot:
                     continue
                 trade_date = datetime.now().strftime('%Y-%m-%d')
-                pt_data = {sym: d['pt_vol'] for sym, d in snapshot.items()}
+                pt_data = {
+                    sym: {'pt_vol': d['pt_vol'], 'avg_pt_price': d['avg_pt_price']}
+                    for sym, d in snapshot.items()
+                }
                 written = await asyncio.to_thread(
                     self.writer.write_pt_vol, pt_data, trade_date
                 )

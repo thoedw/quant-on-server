@@ -42,6 +42,8 @@ class VWAPSnapshot:
         "security_id", "snapshot_time", "vwap",
         "vwap_upper1", "vwap_lower1", "vwap_upper2", "vwap_lower2",
         "cum_volume", "cum_delta", "last_close",
+        # Put-through (thỏa thuận) — đọc từ stock_prices[1D]
+        "pt_vol", "avg_pt_price", "pt_ratio", "avwap_all",
     ]
 
     def __init__(self, security_id: int, snapshot_time: str,
@@ -57,6 +59,11 @@ class VWAPSnapshot:
         self.cum_volume    = cum_volume
         self.cum_delta     = cum_delta
         self.last_close    = last_close
+        # Defaults — populated by compute_all() after fetching 1D row
+        self.pt_vol        = 0
+        self.avg_pt_price  = 0.0
+        self.pt_ratio      = 0.0
+        self.avwap_all     = round(vwap, 4)
 
     def as_tuple(self):
         return (
@@ -200,14 +207,38 @@ class VWAPEngine:
                 grouped[sid] = []
             grouped[sid].append(c)
 
-        # 4. Tính VWAP cho từng mã
+        # 4. Kéo pt_vol + avg_pt_price từ stock_prices[1D]
+        pt_sql = f"""
+            SELECT security_id, COALESCE(pt_vol, 0) as pt_vol,
+                   COALESCE(avg_pt_price, 0.0) as avg_pt_price
+            FROM stock_prices
+            WHERE interval = '1D'
+              AND date(trade_time) = ?
+              AND security_id IN ({placeholders})
+        """
+        pt_rows = conn.execute(pt_sql, [date_vn] + top_ids).fetchall()
+        pt_map: dict[int, tuple[int, float]] = {
+            r["security_id"]: (r["pt_vol"], r["avg_pt_price"]) for r in pt_rows
+        }
+
+        # 5. Tính VWAP cho từng mã, gắn pt fields
         snapshots = []
         for sid, candles in grouped.items():
             snap = self.compute_vwap(candles)
             if snap:
+                pt_vol, avg_pt_price = pt_map.get(sid, (0, 0.0))
+                if pt_vol > 0 and avg_pt_price > 0:
+                    snap.pt_vol       = pt_vol
+                    snap.avg_pt_price = avg_pt_price
+                    total_vol         = snap.cum_volume + pt_vol
+                    snap.pt_ratio     = pt_vol / total_vol if total_vol > 0 else 0.0
+                    snap.avwap_all    = round(
+                        (snap.vwap * snap.cum_volume + avg_pt_price * pt_vol) / total_vol,
+                        4,
+                    )
                 snapshots.append(snap)
 
-        # 5. Upsert vào DB
+        # 6. Upsert vào DB
         if snapshots:
             upsert_sql = """
                 INSERT INTO vwap_snapshots
