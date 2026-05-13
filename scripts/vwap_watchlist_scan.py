@@ -405,12 +405,22 @@ def analyze_index_symbol(conn, symbol: str, DATE_VN: str) -> dict | None:
 
 
 
+
+# ── Cột bảng trái — widths ký tự hiển thị (visible, không kể ANSI) ────────
+#       sym  cls  vwp  vsv  pvw  pvp   dlt   dv   vol   pt  ptp   nn  cov
+_TW = (  7,   7,   7,   6,   7,   7,   12,   7,   7,   6,   5,   7,   6)
+_SEP = '  '  # separator 2 khoảng trắng giữa các cột
+
+# Width cố định bảng trái: sum(widths) + 12 separators × 2 = _LEFT_W chars
+# Dùng để canh right_x trong cả live và static mode
+_LEFT_W: int = sum(_TW) + (len(_TW) - 1) * len(_SEP)
+
+
 def _summary_table_lines(results) -> list:
-    """Trả về list các dòng cho bảng tóm tắt — ANSI/emoji-aware column alignment."""
-    # ── Visible column widths (ký tự hiển thị, không kể ANSI/emoji padding) ──
-    #   sym  cls  vwp  vsv  pvw  pvp  dlt   dv   vol   pt  ptp   nn  cov
-    W = (8,   8,   8,   6,   8,   7,   13,   8,   7,   7,   5,   8,   7)
-    S = '  '  # separator giữa các cột
+    """Trả về list các dòng cho bảng tóm tắt — ANSI/emoji-aware column alignment.
+    Signals KHÔNG hiển thị ở đây — xem right panel để có đủ thông tin."""
+    W = _TW
+    S = _SEP
 
     # Header — plain text, no ANSI, widths match W
     cols_h = [
@@ -418,21 +428,10 @@ def _summary_table_lines(results) -> list:
         f"{'vsV%':>{W[3]}}",  f"{'PVWAP':>{W[4]}}",  f"{'pvp%':>{W[5]}}",
         f"{'Delta':>{W[6]}}",  f"{'Δ/V%':>{W[7]}}",  f"{'Vol(M)':>{W[8]}}",
         f"{'PT(M)':>{W[9]}}",  f"{'PT%':>{W[10]}}",  f"{'NN Net':>{W[11]}}",
-        f"{'Cov%':>{W[12]}}",  'Signals',
+        f"{'Cov%':>{W[12]}}",
     ]
     hdr = S.join(cols_h)
     lines = [hdr, '─' * _visual_len(hdr)]
-
-    # Compact signal display: ABBR(score) — readable text, cột hẹp
-    def _sig_compact(signals):
-        if not signals:
-            return '—'
-        parts = []
-        for s, dir_, sc, __ in signals[:2]:
-            abbr = SIG_ABBR.get(s, s[:10])
-            clr  = G if dir_ == 'BUY' else R
-            parts.append(f"{clr}{abbr}({sc:.0f}){E}")
-        return '  '.join(parts)
 
     for r in results:
         is_idx = r.get('is_index', False)
@@ -511,16 +510,10 @@ def _summary_table_lines(results) -> list:
         # Cov% — right-aligned, W[12]-1 digits + "%"
         cov_s = f"{r['side_cov']:>{W[12]-1}.1f}%"
 
-        # Signals — compact icon+score, limit width to avoid blowing out columns
-        if is_lim:
-            sig_s = '⛔TRẦN' if r['close'] >= (pv or r['close']) else '⛔SÀN'
-        else:
-            sig_s = _sig_compact(r['signals'])
-
         row = S.join([
             sym_s, close_s, vwap_s, vsv_s, pvwap_s, pvp_s,
             delta_s, dv_s, vol_s, pt_s, ptp_s, nn_s, cov_s,
-        ]) + S + sig_s
+        ])
         lines.append(row)
 
     return lines
@@ -865,8 +858,7 @@ def _render_clear(left: list, right: list, cycle: int, interval: int) -> None:
     term_h  = term.lines
     max_rows = max(5, term_h - 3)
 
-    col_w   = term_w * 3 // 5     # cột trái chiếm 60% màn hình
-    right_x = col_w + 3           # cột phải bắt đầu tại 60%+3
+    right_x = _LEFT_W + 4         # cột phải bắt đầu tại sau bảng trái cố định + 4
 
     left_vis  = left[:max_rows]
     right_vis = right[:max_rows]
@@ -907,8 +899,7 @@ def _print_side_by_side(left: list, right: list) -> None:
     term_w  = shutil.get_terminal_size(fallback=(160, 45)).columns
     # right_x: bắt đầu cột phải tại max visible width của cột trái + 4 chars gap
     # Dùng header (dòng đầu, không có ANSI màu) để đo ổn định hơn
-    left_w  = max((_visual_len(l) for l in left), default=80)
-    right_x = min(left_w + 4, term_w - 30)   # không đẩy cột phải ra ngoài màn hình
+    right_x = _LEFT_W + 4         # bắt đầu cột phải tại sau bảng trái cố định + 4
 
     n = max(len(left), len(right))
     out = []
