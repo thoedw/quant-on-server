@@ -394,56 +394,121 @@ def analyze_index_symbol(conn, symbol: str, DATE_VN: str) -> dict | None:
 
 
 def _summary_table_lines(results) -> list:
-    """Trả về list các dòng cho bảng tóm tắt (không print trực tiếp)."""
-    lines = []
-    lines.append(f"  {'SYM':<8} {'Close':>8} {'VWAP':>8} {'vsV%':>5}  {'PVWAP':>8} {'pvp%':>6}  {'Delta':>12}  {'Δ/V%':>6}  {'Vol(M)':>6}  {'PT(M)':>6} {'PT%':>5}  {'NN Net':>8}  {'Cov%':>5}  Signals")
-    lines.append(f"  {'─'*100}")
-    for r in results:
-        is_idx   = r.get('is_index', False)
-        sym_col  = f"{B}{C if is_idx else ''}{r['sym']:<8}{E}" if is_idx else f"  {B}{r['sym']:<5}{E}"
-        # index dùng prefix khác để căn đều
-        sym_pfx  = '' if is_idx else '  '
-        vs_v_col = f"{G if r['vs_vwap'] >= 0 else R}{r['vs_vwap']:>+4.1f}%{E}"
-        vs_p_str = f"{r['vs_pv']:>+5.2f}%" if r['vs_pv'] is not None else "   — "
-        is_lim   = r.get('is_limit', False)
-        d_col    = f"{Y}{'N/A (TRẦN/SÀN)':>12}{E}" if is_lim else f"{G if r['delta'] >= 0 else R}{r['delta']:>+12,}{E}"
-        pv_str   = f"{r['pvwap']:.2f}" if r['pvwap'] else "     —  "
-        sig_str  = ("⛔TRẦN" if r['close'] >= (r.get('pvwap') or r['close'])
-                    else "⛔SÀN") if is_lim else (
-            "  ".join(f"{s}({sc:.0f})" for s, _, sc, __ in r['signals'][:2]) or "-"
+    """Trả về list các dòng cho bảng tóm tắt — ANSI/emoji-aware column alignment."""
+    # ── Visible column widths (ký tự hiển thị, không kể ANSI/emoji padding) ──
+    #   sym  cls  vwp  vsv  pvw  pvp  dlt   dv   vol   pt  ptp   nn  cov
+    W = (8,   8,   8,   6,   8,   7,   13,   8,   7,   7,   5,   8,   7)
+    S = '  '  # separator giữa các cột
+
+    # Header — plain text, no ANSI, widths match W
+    cols_h = [
+        f"{'SYM':<{W[0]}}",  f"{'Close':>{W[1]}}",  f"{'VWAP':>{W[2]}}",
+        f"{'vsV%':>{W[3]}}",  f"{'PVWAP':>{W[4]}}",  f"{'pvp%':>{W[5]}}",
+        f"{'Delta':>{W[6]}}",  f"{'Δ/V%':>{W[7]}}",  f"{'Vol(M)':>{W[8]}}",
+        f"{'PT(M)':>{W[9]}}",  f"{'PT%':>{W[10]}}",  f"{'NN Net':>{W[11]}}",
+        f"{'Cov%':>{W[12]}}",  'Signals',
+    ]
+    hdr = S.join(cols_h)
+    lines = [hdr, '─' * _visual_len(hdr)]
+
+    # Compact signal display: ICON(score) pairs only — giữ cột Signals hẹp
+    def _sig_compact(signals):
+        if not signals:
+            return '—'
+        return '  '.join(
+            f"{_ljust(ICONS.get(s, '•'), 2)}({sc:.0f})"
+            for s, _, sc, __ in signals[:2]
         )
-        dv_pct   = r['delta'] / max(r['total_vol'], 1) * 100
-        dv_col   = f"{Y}{'  N/A':>6}{E}" if is_lim else f"{G if r['delta'] >= 0 else R}{dv_pct:>+6.1f}%{E}"
-        # Format: index rows dùng in đậm + có prefix 2 spaces cho cột sym rộng
-        if is_idx:
-            lines.append(
-                f"  {B}{C}{r['sym']:<8}{E}"
-                f" {r['close']:>8.2f} {r['vwap']:>8.2f} "
-                f"{vs_v_col}  {pv_str:>8} {vs_p_str}  {d_col}  "
-                f"{dv_col}  "
-                f"{r['total_vol']/1e6:>6.2f}M       —       —    {r['side_cov']:>5.1f}%  {sig_str}"
-            )
+
+    for r in results:
+        is_idx = r.get('is_index', False)
+        is_lim = r.get('is_limit', False)
+
+        pv     = r['pvwap']
+        vsv    = r['vs_vwap']
+        vsp    = r['vs_pv']
+        dlt    = r['delta']
+        tv     = max(r['total_vol'], 1)
+        dv_pct = dlt / tv * 100
+        pt_v   = r.get('pt_vol', 0)
+        pt_rt  = r.get('pt_ratio', 0.0)
+        avg_pt = r.get('avg_pt_price', 0.0)
+        vwap_r = r.get('vwap', 0.0)
+        nn_net = r.get('nn_net', 0)
+
+        # SYM — bold, cyan for index rows
+        sym_s = _ljust(
+            f"{B}{C if is_idx else ''}{r['sym']}{E if not is_idx else E}",
+            W[0]
+        )
+
+        # Numeric columns — plain, right-aligned (no color needed)
+        close_s = f"{r['close']:>{W[1]}.2f}"
+        vwap_s  = f"{r['vwap']:>{W[2]}.2f}"
+
+        # vsV% — colored, ANSI-aware pad
+        vsv_s = _rjust(f"{G if vsv >= 0 else R}{vsv:>+.1f}%{E}", W[3])
+
+        # PVWAP — plain
+        pvwap_s = f"{pv:{W[4]}.2f}" if pv else f"{'—':>{W[4]}}"
+
+        # pvp% — colored or dash; MUST be W[5] visible chars
+        if vsp is not None:
+            pvp_s = _rjust(f"{G if vsp >= 0 else R}{vsp:>+.2f}%{E}", W[5])
         else:
-            pt_m      = r.get('pt_vol', 0) / 1e6
-            pt_ratio  = r.get('pt_ratio', 0.0)
-            avg_pt    = r.get('avg_pt_price', 0.0)
-            vwap_r    = r.get('vwap', 0.0)
-            nn_net    = r.get('nn_net', 0)
-            nn_col    = (f"{G}{nn_net/1e3:>+6.0f}K{E}" if nn_net > 0 else
-                         f"{R}{nn_net/1e3:>+6.0f}K{E}" if nn_net < 0 else "      —  ")
-            pt_col    = f"{pt_m:>6.2f}M" if pt_m > 0 else "     — "
-            if pt_ratio > 0 and avg_pt > 0 and vwap_r > 0:
-                pct_str = f"{pt_ratio*100:>4.1f}%"
-                pt_pct_col = f"{G}{pct_str}{E}" if avg_pt > vwap_r else f"{R}{pct_str}{E}"
-            else:
-                pt_pct_col = "    — "
-            lines.append(
-                f"  {B}{r['sym']:<8}{E}"
-                f" {r['close']:>8.2f} {r['vwap']:>8.2f} "
-                f"{vs_v_col}  {pv_str:>8} {vs_p_str}  {d_col}  "
-                f"{dv_col}  "
-                f"{r['total_vol']/1e6:>6.2f}M  {pt_col} {pt_pct_col}  {nn_col}  {r['side_cov']:>5.1f}%  {sig_str}"
-            )
+            pvp_s = f"{'—':>{W[5]}}"
+
+        # Delta — colored + comma-formatted
+        if is_lim:
+            delta_s = _rjust(f"{Y}N/A{E}", W[6])
+        else:
+            delta_s = _rjust(f"{G if dlt >= 0 else R}{dlt:>+,}{E}", W[6])
+
+        # Δ/V% — colored
+        if is_lim:
+            dv_s = _rjust(f"{Y}N/A{E}", W[7])
+        else:
+            dv_s = _rjust(f"{G if dv_pct >= 0 else R}{dv_pct:>+.1f}%{E}", W[7])
+
+        # Vol(M) — right-aligned, W[8]-1 digits + "M"
+        vol_s = f"{r['total_vol']/1e6:>{W[8]-1}.2f}M"
+
+        # PT(M) — right-aligned, W[9]-1 digits + "M", or dash
+        if not is_idx and pt_v > 0:
+            pt_s = f"{pt_v/1e6:>{W[9]-1}.2f}M"
+        else:
+            pt_s = f"{'—':>{W[9]}}"
+
+        # PT% — colored or dash; exact W[10] visible chars
+        if not is_idx and pt_rt > 0 and avg_pt > 0 and vwap_r > 0:
+            pct = pt_rt * 100
+            clr = G if avg_pt > vwap_r else R
+            ptp_s = _rjust(f"{clr}{pct:.1f}%{E}", W[10])
+        else:
+            ptp_s = f"{'—':>{W[10]}}"
+
+        # NN Net — colored or dash; exact W[11] visible chars
+        if not is_idx and nn_net != 0:
+            clr = G if nn_net > 0 else R
+            nn_s = _rjust(f"{clr}{nn_net/1e3:>+.0f}K{E}", W[11])
+        else:
+            nn_s = f"{'—':>{W[11]}}"
+
+        # Cov% — right-aligned, W[12]-1 digits + "%"
+        cov_s = f"{r['side_cov']:>{W[12]-1}.1f}%"
+
+        # Signals — compact icon+score, limit width to avoid blowing out columns
+        if is_lim:
+            sig_s = '⛔TRẦN' if r['close'] >= (pv or r['close']) else '⛔SÀN'
+        else:
+            sig_s = _sig_compact(r['signals'])
+
+        row = S.join([
+            sym_s, close_s, vwap_s, vsv_s, pvwap_s, pvp_s,
+            delta_s, dv_s, vol_s, pt_s, ptp_s, nn_s, cov_s,
+        ]) + S + sig_s
+        lines.append(row)
+
     return lines
 
 
@@ -762,6 +827,14 @@ def _visual_len(s: str) -> int:
         else:
             w += 1
     return w
+
+def _rjust(s: str, w: int) -> str:
+    """Right-justify s to visible width w (ANSI + emoji aware)."""
+    return ' ' * max(0, w - _visual_len(s)) + s
+
+def _ljust(s: str, w: int) -> str:
+    """Left-justify s to visible width w (ANSI + emoji aware)."""
+    return s + ' ' * max(0, w - _visual_len(s))
 
 # Keep old name as alias for compatibility
 _strip_ansi = lambda s: _re.sub(r'\x1b\[[0-9;]*m', '', s)
