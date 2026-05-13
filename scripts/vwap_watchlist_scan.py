@@ -97,6 +97,18 @@ ICONS = {
     'PVWAP_SUPPORT_TEST': '🎯',  'VWAP_BOUNCE': '🔁',
 }
 
+# Tên viết tắt cho cột Signals bảng trái — đủ để nhận biết, vừa cột hẹp
+SIG_ABBR = {
+    'HIDDEN_ACCUMULATION': 'HIDD_ACCUM',
+    'VWAP_RECLAIM':        'VWAP_RECLAIM',
+    'DELTA_DIVERGENCE':    'DELTA_DIV',
+    'VWAP_REJECTION':      'VWAP_REJECT',
+    'PVWAP_SUPPORT_TEST':  'PVWAP_SUPP',
+    'VWAP_BOUNCE':         'VWAP_BOUNCE',
+    'PT_DUMPING':          'PT_DUMPING',
+    'PT_ACCUMULATION':     'PT_ACCUM',
+}
+
 G = "\033[92m"; R = "\033[91m"; Y = "\033[93m"; C = "\033[96m"
 B = "\033[1m";  E = "\033[0m"
 
@@ -411,14 +423,16 @@ def _summary_table_lines(results) -> list:
     hdr = S.join(cols_h)
     lines = [hdr, '─' * _visual_len(hdr)]
 
-    # Compact signal display: ICON(score) pairs only — giữ cột Signals hẹp
+    # Compact signal display: ABBR(score) — readable text, cột hẹp
     def _sig_compact(signals):
         if not signals:
             return '—'
-        return '  '.join(
-            f"{_ljust(ICONS.get(s, '•'), 2)}({sc:.0f})"
-            for s, _, sc, __ in signals[:2]
-        )
+        parts = []
+        for s, dir_, sc, __ in signals[:2]:
+            abbr = SIG_ABBR.get(s, s[:10])
+            clr  = G if dir_ == 'BUY' else R
+            parts.append(f"{clr}{abbr}({sc:.0f}){E}")
+        return '  '.join(parts)
 
     for r in results:
         is_idx = r.get('is_index', False)
@@ -881,6 +895,32 @@ def _render_clear(left: list, right: list, cycle: int, interval: int) -> None:
 
 
 # ════════════════════════════════════════════════════════════════
+# STATIC SIDE-BY-SIDE PRINTER  (non-live mode)
+# ════════════════════════════════════════════════════════════════
+
+def _print_side_by_side(left: list, right: list) -> None:
+    """
+    In hai bảng cạnh nhau trên cùng terminal — không cần loop.
+    Dùng escape CHA (\\033[{N}G) để cột phải bắt đầu tại cột cố định,
+    bất kể cột trái rộng bao nhiêu (cùng cơ chế với _render_clear).
+    """
+    term_w  = shutil.get_terminal_size(fallback=(160, 45)).columns
+    # right_x: bắt đầu cột phải tại max visible width của cột trái + 4 chars gap
+    # Dùng header (dòng đầu, không có ANSI màu) để đo ổn định hơn
+    left_w  = max((_visual_len(l) for l in left), default=80)
+    right_x = min(left_w + 4, term_w - 30)   # không đẩy cột phải ra ngoài màn hình
+
+    n = max(len(left), len(right))
+    out = []
+    for i in range(n):
+        l = left[i]  if i < len(left)  else ''
+        r = right[i] if i < len(right) else ''
+        out.append(l + f"\033[{right_x}G" + r)
+    sys.stdout.write('\n'.join(out) + '\n')
+    sys.stdout.flush()
+
+
+# ════════════════════════════════════════════════════════════════
 # MAIN
 # ════════════════════════════════════════════════════════════════
 
@@ -910,10 +950,7 @@ def main():
             print(f"\n\n  👋 Live mode đã dừng.\n")
     else:
         left, right = run_scan(args)
-        # Non-live: in cột trái, sau đó signal digest ở dưới
-        print("\n".join(left))
-        if right:
-            print("\n".join(right))
+        _print_side_by_side(left, right)
 
 
 if __name__ == "__main__":
