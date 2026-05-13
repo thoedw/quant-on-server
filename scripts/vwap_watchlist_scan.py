@@ -151,6 +151,7 @@ def _fetch_pt_nn_1d(conn, DATE_VN: str) -> dict:
         JOIN securities s ON s.security_id = sp.security_id
         WHERE sp.interval = '1D'
           AND date(sp.trade_time) = ?
+          AND sp.volume > 0   -- chỉ lấy bar đã settle (volume=0 → bar chưa có data thực)
     """, (DATE_VN,)).fetchall()
     result = {}
     for r in rows:
