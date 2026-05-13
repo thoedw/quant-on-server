@@ -89,6 +89,14 @@ def _visible_len(s: str) -> int:
     """Độ dài hiển thị thực (bỏ ANSI escape codes)."""
     return len(_ANSI_RE.sub('', s))
 
+def _rjust(s: str, w: int) -> str:
+    """Right-justify ANSI string to visible width w."""
+    return ' ' * max(0, w - _visible_len(s)) + s
+
+def _ljust(s: str, w: int) -> str:
+    """Left-justify ANSI string to visible width w."""
+    return s + ' ' * max(0, w - _visible_len(s))
+
 
 # ════════════════════════════════════════════════════════════════
 # ANALYSIS CORE
@@ -193,6 +201,10 @@ def analyze_symbol(conn, sid, symbol, DATE_VN, session_open, all_snaps, wh, delt
                 signals.append((sig, dir_, sc, det))
         signals.sort(key=lambda x: -x[2])
 
+    # pt_vol / pt_ratio from intraday VWAP snapshot (populated by VWAPEngine)
+    pt_vol   = snap_obj.pt_vol   if snap_obj else 0
+    pt_ratio = snap_obj.pt_ratio if snap_obj else 0.0
+
     return {
         'sym': symbol, 'close': close_c, 'open': first[1],
         'high': h_high, 'low': h_low,
@@ -200,7 +212,9 @@ def analyze_symbol(conn, sid, symbol, DATE_VN, session_open, all_snaps, wh, delt
         'pvwap': pv, 'pvwap_date': pv_date,
         'vs_vwap': vs_vwap, 'vs_pv': vs_pv,
         'delta': total_d, 'total_vol': total_vol,
+        'dv_pct': total_d / total_vol * 100 if total_vol else 0.0,
         'buy_vol': total_bv, 'sell_vol': total_sv,
+        'pt_vol': pt_vol, 'pt_ratio': pt_ratio,
         'side_cov': side_cov, 'ncandles': len(rows),
         'bounces': bounces, 'signals': signals,
         'hist_deltas': hist_deltas,
@@ -213,28 +227,104 @@ def analyze_symbol(conn, sid, symbol, DATE_VN, session_open, all_snaps, wh, delt
 # ════════════════════════════════════════════════════════════════
 
 def _summary_table_lines(results) -> list:
-    """Trả về list các dòng cho bảng tóm tắt (không print trực tiếp)."""
-    lines = []
-    lines.append(f"  {'SYM':<5} {'Close':>6} {'VWAP':>6} {'vsV%':>5}  {'PVWAP':>6} {'pvp%':>6}  {'Delta':>12}  {'Vol(M)':>6}  {'Cov%':>5}  Signals")
-    lines.append(f"  {'─'*88}")
+    """Trả về list các dòng cho bảng tóm tắt — ANSI-aware alignment."""
+    # ── Column visible widths ──────────────────────────────────
+    #  sym  close  vwap  vsv  pvwap  pvp  delta   dv   vol   pt   ptp  cov
+    W  = (5,   6,    6,   6,   6,    7,   11,    7,   7,   6,    5,   5)
+    S  = '  '  # col separator
+
+    def hrow(*labels):
+        cols = [f"{lb:>{w}}" for lb, w in zip(labels, W)]
+        return S.join(cols)
+
+    hdr = hrow('SYM', 'Close', 'VWAP', 'vsV%', 'PVWAP', 'pvp%',
+               'Delta', 'Δ/V%', 'Vol(M)', 'PT(M)', 'PT%', 'Cov%') + S + 'Signals'
+    # left-justify SYM header
+    hdr = f"{'SYM':<{W[0]}}" + hdr[W[0]:]
+    sep = '─' * _visible_len(hdr)
+
+    lines = [hdr, sep]
+
     for r in results:
-        vs_v_col = f"{G if r['vs_vwap'] >= 0 else R}{r['vs_vwap']:>+4.1f}%{E}"
-        vs_p_str = f"{r['vs_pv']:>+5.2f}%" if r['vs_pv'] is not None else "   — "
-        d_col    = f"{G if r['delta'] >= 0 else R}{r['delta']:>+12,}{E}"
-        pv_str   = f"{r['pvwap']:.2f}" if r['pvwap'] else "  —  "
-        sig_str  = "  ".join(f"{ICONS.get(s,'•')}{s[:4]}({sc:.0f})"
-                             for s, _, sc, __ in r['signals'][:2]) or "—"
-        lines.append(
-            f"  {B}{r['sym']:<5}{E} {r['close']:>6.2f} {r['vwap']:>6.2f} "
-            f"{vs_v_col}  {pv_str:>6} {vs_p_str}  {d_col}  "
-            f"{r['total_vol']/1e6:>6.2f}M  {r['side_cov']:>5.1f}%  {sig_str}"
+        pv    = r['pvwap']
+        vsv   = r['vs_vwap']
+        vsp   = r['vs_pv']
+        dlt   = r['delta']
+        dv    = r.get('dv_pct', dlt / r['total_vol'] * 100 if r['total_vol'] else 0)
+        pt_v  = r.get('pt_vol', 0)
+        pt_rt = r.get('pt_ratio', 0.0)
+
+        sym_s   = _ljust(f"{B}{r['sym']}{E}", W[0])
+        close_s = f"{r['close']:>{W[1]}.2f}"
+        vwap_s  = f"{r['vwap']:>{W[2]}.2f}"
+        vsv_s   = _rjust(f"{G if vsv >= 0 else R}{vsv:>+.1f}%{E}", W[3])
+        pvwap_s = f"{pv:>{W[4]}.2f}" if pv else f"{'—':>{W[4]}}"
+        pvp_s   = (
+            _rjust(f"{G if vsp >= 0 else R}{vsp:>+.2f}%{E}", W[5])
+            if vsp is not None else f"{'—':>{W[5]}}"
         )
+        dlt_s   = _rjust(f"{G if dlt >= 0 else R}{dlt:>+,}{E}", W[6])
+        dv_s    = _rjust(f"{G if dv  >= 0 else R}{dv:>+.1f}%{E}", W[7])
+        vol_s   = f"{r['total_vol']/1e6:>{W[8]-1}.2f}M"
+        pt_s    = (f"{pt_v/1e6:>{W[9]-1}.2f}M" if pt_v > 0 else f"{'—':>{W[9]}}")
+        ptp_s   = (f"{pt_rt*100:>{W[10]-1}.1f}%" if pt_v > 0 else f"{'—':>{W[10]}}")
+        cov_s   = f"{r['side_cov']:>{W[11]-1}.1f}%"
+        sig_s   = ('  '.join(
+            f"{ICONS.get(s,'•')}{s[:4]}({sc:.0f})"
+            for s, _, sc, __ in r['signals'][:2]
+        ) or '—')
+
+        row = S.join([sym_s, close_s, vwap_s, vsv_s, pvwap_s, pvp_s,
+                      dlt_s, dv_s, vol_s, pt_s, ptp_s, cov_s]) + S + sig_s
+        lines.append(row)
+
     return lines
 
 
 def print_summary_table(results):
     for line in _summary_table_lines(results):
         print(line)
+
+
+def _signal_panel_lines(triggered: list, data_ok: bool) -> list:
+    """Right-side signal digest panel — aligned, compact."""
+    # triggered: list of (sym, sig, dir_, sc, det, delta, dv_pct)
+    DELTA_SIGNALS = {'HIDDEN_ACCUMULATION', 'DELTA_DIVERGENCE', 'VWAP_REJECTION', 'VWAP_RECLAIM'}
+    S  = '  '
+    #       sym  dir  signal  sc  delta  dv
+    W  = (5,   4,   22,    3,   8,    7)
+
+    hdr = S.join([
+        f"{'SYM':<{W[0]}}",
+        f"{'DIR':<{W[1]}}",
+        f"{'SIGNAL':<{W[2]}}",
+        f"{'SC':>{W[3]}}",
+        f"{'Delta':>{W[4]}}",
+        f"{'Δ/V%':>{W[5]}}",
+    ])
+    lines = [f"{B}{hdr}{E}", '─' * _visible_len(hdr)]
+
+    if not triggered:
+        lines.append('  ⚪ No signals')
+        return lines
+
+    for sym, sig, dir_, sc, det, delta, dv_pct in triggered:
+        low_data = (not data_ok) and (sig in DELTA_SIGNALS)
+        dir_c    = G if dir_ == 'BUY' else R
+        dlt_c    = G if delta >= 0 else R
+        dv_c     = G if dv_pct >= 0 else R
+
+        sym_s  = _ljust(f"{B}{sym}{E}", W[0])
+        dir_s  = _ljust(f"{dir_c}{dir_}{E}", W[1])
+        sig_s  = _ljust(sig, W[2])
+        sc_s   = _rjust(f"{sc:.0f}", W[3])
+        dlt_s  = _rjust(f"{dlt_c}{delta/1e6:>+.2f}M{E}", W[4])
+        dv_s   = _rjust(f"{dv_c}{dv_pct:>+.1f}%{E}", W[5])
+        tag    = f" {Y}[!]{E}" if low_data else ''
+
+        lines.append(S.join([sym_s, dir_s, sig_s, sc_s, dlt_s, dv_s]) + tag)
+
+    return lines
 
 
 def print_detail(r, show_hours=True):
@@ -336,45 +426,62 @@ def run_scan(args):
         display = sorted(results, key=lambda r: -r['delta'])[:args.top]
 
     # ── Build output lines buffer ──────────────────────────────────
+    import shutil
+    DELTA_SIGNALS = {'HIDDEN_ACCUMULATION', 'DELTA_DIVERGENCE', 'VWAP_REJECTION', 'VWAP_RECLAIM'}
+    data_ok  = delta_reliable
+    term_w   = shutil.get_terminal_size((160, 40)).columns
+
+    # triggered: (sym, sig, dir_, sc, det, delta, dv_pct)
+    triggered = [
+        (r['sym'], sig, dir_, sc, det, r['delta'], r.get('dv_pct', 0.0))
+        for r in results for sig, dir_, sc, det in r['signals']
+    ]
+    triggered.sort(key=lambda x: -x[3])
+
+    # ── Header ────────────────────────────────────────────────
     lines: list[str] = []
-    lines.append(f"{'='*72}")
-    lines.append(f"  {B}{C}📋 VWAP WATCHLIST {label} — {now_vn}  ({len(watchlist)} mã, {label_src}){E}")
-    lines.append(f"{'='*72}")
+    hdr_title = f"  {B}{C}📋 VWAP WATCHLIST {label} — {now_vn}  ({len(watchlist)} mã, {label_src}){E}"
+    lines.append('═' * term_w)
+    lines.append(hdr_title)
+    lines.append('═' * term_w)
     lines.append(f"  Market Side Coverage: {mkt_cov}% | delta_reliable={delta_reliable}")
 
-    if display:
-        lines.append("")
-        lines.extend(_summary_table_lines(display))
-        lines.append(f"  Tổng: {len(display)}/{len(results)} mã")
-
-    # Signal digest
-    triggered = [(r['sym'], *sig) for r in results for sig in r['signals']]
-    triggered.sort(key=lambda x: -x[3])
-    lines.append(f"{'─'*72}")
-    lines.append(f"  🔔 SIGNAL DIGEST (score ≥ {MIN_SCORE}):")
-
-    # ── DATA QUALITY GATE ──────────────────────────────────────
-    # Signal DELTA-DEPENDENT: HIDDEN_ACCUMULATION, DELTA_DIVERGENCE,
-    # VWAP_REJECTION, VWAP_RECLAIM (có delta guard).
-    # Signal PRICE-ONLY:      VWAP_BOUNCE, PVWAP_SUPPORT_TEST (không cần delta).
-    DELTA_SIGNALS = {'HIDDEN_ACCUMULATION', 'DELTA_DIVERGENCE', 'VWAP_REJECTION', 'VWAP_RECLAIM'}
-    data_ok = delta_reliable   # True nếu coverage ≥ 50%
-
     if not data_ok:
-        lines.append(f"  {R}{B}⚠️  DATA QUALITY WARNING: Side Coverage={mkt_cov}% (ngưỡng an toàn ≥50%){E}")
-        lines.append(f"  {R}   MASVN có thể bị FROZEN. Các signal dưới đây có độ tin cậy thấp.{E}")
-        lines.append(f"  {R}   KHÔNG nên giao dịch dựa trên VWAP_REJECTION/RECLAIM hôm nay.{E}")
-        lines.append(f"  {'─'*72}")
+        lines.append(f"  {R}{B}⚠  Side Coverage={mkt_cov}% (<50%) — delta signals độ tin cậy thấp{E}")
 
-    if triggered:
-        for sym, sig, dir_, sc, det in triggered:
-            d_icon = '⬆️ BUY' if dir_ == 'BUY' else '⬇️ SELL'
-            is_delta_dep = sig in DELTA_SIGNALS
-            quality_tag  = f" {Y}[LOW-DATA]{E}" if (not data_ok and is_delta_dep) else ""
-            lines.append(f"  {ICONS.get(sig,'•')} {B}{sym:<5}{E} {sig:<22} {d_icon:<10} score={sc:.0f}{quality_tag}")
-    else:
+    if display:
+        # ── Left panel: main table ─────────────────────────────
+        left = _summary_table_lines(display)
+        left_w = max((_visible_len(l) for l in left), default=0)
+
+        # ── Right panel: signal digest ─────────────────────────
+        right = _signal_panel_lines(triggered, data_ok)
+        right_w = max((_visible_len(l) for l in right), default=0)
+
+        GAP = 4  # chars between panels
+        if left_w + GAP + right_w <= term_w and triggered:
+            # Side-by-side
+            nrows = max(len(left), len(right))
+            lines.append('')
+            for i in range(nrows):
+                lpart = left[i]  if i < len(left)  else ''
+                rpart = right[i] if i < len(right) else ''
+                pad   = ' ' * (left_w - _visible_len(lpart) + GAP)
+                lines.append(lpart + pad + rpart)
+        else:
+            # Stacked
+            lines.append('')
+            lines.extend(left)
+            if triggered:
+                lines.append('')
+                lines.append(f"  {B}🔔 SIGNAL DIGEST (score ≥ {MIN_SCORE}):{E}")
+                lines.extend(right)
+
+        lines.append(f"  Tổng: {len(display)}/{len(results)} mã")
+    elif not triggered:
         lines.append("  ⚪ Không có signal nào kích hoạt")
-    lines.append(f"{'='*72}")
+
+    lines.append('═' * term_w)
 
     # Chi tiết chỉ in khi không phải live mode
     if not args.no_detail and not is_live:
