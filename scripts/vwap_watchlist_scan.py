@@ -411,14 +411,28 @@ def analyze_index_symbol(conn, symbol: str, DATE_VN: str) -> dict | None:
 _TW = (  7,   7,   7,   6,   7,   7,   12,   7,   7,   6,   5,   7,   6)
 _SEP = '  '  # separator 2 khoảng trắng giữa các cột
 
-# Width cố định bảng trái: sum(widths) + 12 separators × 2 = _LEFT_W chars
-# Dùng để canh right_x trong cả live và static mode
+# Width cố định bảng trái (13 cột): sum(widths) + 12 separators × 2 = 115 chars
 _LEFT_W: int = sum(_TW) + (len(_TW) - 1) * len(_SEP)
+
+_SIG_COL_W    = 14    # Signals column: top signal abbrev + "+N" suffix, no emoji
+_TOTAL_LEFT_W = _LEFT_W + len(_SEP) + _SIG_COL_W   # = 131 chars
+
+_RIGHT_W      = 62    # visible width of right signal panel (header = 60, data = 61)
+
+
+def _sig_abbrev(signals: list) -> str:
+    """Compact text-only signal string for the Signals column in left table.
+    Shows highest-score signal abbrev + '+N' if more. No emoji. Fits _SIG_COL_W."""
+    if not signals:
+        return ' ' * _SIG_COL_W
+    sorted_sigs = sorted(signals, key=lambda x: -x[2])
+    first = SIG_ABBR.get(sorted_sigs[0][0], sorted_sigs[0][0][:12])
+    text = first if len(sorted_sigs) == 1 else f"{first} +{len(sorted_sigs)-1}"
+    return f"{text[:_SIG_COL_W]:<{_SIG_COL_W}}"
 
 
 def _summary_table_lines(results) -> list:
-    """Trả về list các dòng cho bảng tóm tắt — ANSI/emoji-aware column alignment.
-    Signals KHÔNG hiển thị ở đây — xem right panel để có đủ thông tin."""
+    """Trả về list các dòng cho bảng tóm tắt — ANSI/emoji-aware column alignment."""
     W = _TW
     S = _SEP
 
@@ -428,7 +442,7 @@ def _summary_table_lines(results) -> list:
         f"{'vsV%':>{W[3]}}",  f"{'PVWAP':>{W[4]}}",  f"{'pvp%':>{W[5]}}",
         f"{'Delta':>{W[6]}}",  f"{'Δ/V%':>{W[7]}}",  f"{'Vol(M)':>{W[8]}}",
         f"{'PT(M)':>{W[9]}}",  f"{'PT%':>{W[10]}}",  f"{'NN Net':>{W[11]}}",
-        f"{'Cov%':>{W[12]}}",
+        f"{'Cov%':>{W[12]}}",  f"{'Signals':<{_SIG_COL_W}}",
     ]
     hdr = S.join(cols_h)
     lines = [hdr, '─' * _visual_len(hdr)]
@@ -510,9 +524,16 @@ def _summary_table_lines(results) -> list:
         # Cov% — right-aligned, W[12]-1 digits + "%"
         cov_s = f"{r['side_cov']:>{W[12]-1}.1f}%"
 
+        # Signals column — text abbreviations, no emoji
+        if is_lim:
+            lim_text = 'TRAN' if r['close'] >= (pv or r['close']) else 'SAN'
+            sig_s = f"{lim_text:<{_SIG_COL_W}}"
+        else:
+            sig_s = _sig_abbrev(r['signals'])
+
         row = S.join([
             sym_s, close_s, vwap_s, vsv_s, pvwap_s, pvp_s,
-            delta_s, dv_s, vol_s, pt_s, ptp_s, nn_s, cov_s,
+            delta_s, dv_s, vol_s, pt_s, ptp_s, nn_s, cov_s, sig_s,
         ])
         lines.append(row)
 
@@ -858,7 +879,8 @@ def _render_clear(left: list, right: list, cycle: int, interval: int) -> None:
     term_h  = term.lines
     max_rows = max(5, term_h - 3)
 
-    right_x = _LEFT_W + 4         # cột phải bắt đầu tại sau bảng trái cố định + 4
+    # Đẩy right panel sát phải: max(sau bảng trái, flush-right từ phải)
+    right_x = max(_TOTAL_LEFT_W + 4, term_w - _RIGHT_W - 2)
 
     left_vis  = left[:max_rows]
     right_vis = right[:max_rows]
@@ -899,7 +921,8 @@ def _print_side_by_side(left: list, right: list) -> None:
     term_w  = shutil.get_terminal_size(fallback=(160, 45)).columns
     # right_x: bắt đầu cột phải tại max visible width của cột trái + 4 chars gap
     # Dùng header (dòng đầu, không có ANSI màu) để đo ổn định hơn
-    right_x = _LEFT_W + 4         # bắt đầu cột phải tại sau bảng trái cố định + 4
+    # Đẩy right panel sát phải: max(sau bảng trái, flush-right từ phải)
+    right_x = max(_TOTAL_LEFT_W + 4, term_w - _RIGHT_W - 2)
 
     n = max(len(left), len(right))
     out = []
