@@ -414,20 +414,23 @@ _SEP = '  '  # separator 2 khoảng trắng giữa các cột
 # Width cố định bảng trái (13 cột): sum(widths) + 12 separators × 2 = 115 chars
 _LEFT_W: int = sum(_TW) + (len(_TW) - 1) * len(_SEP)
 
-_SIG_COL_W    = 14    # Signals column: top signal abbrev + "+N" suffix, no emoji
-_TOTAL_LEFT_W = _LEFT_W + len(_SEP) + _SIG_COL_W   # = 131 chars
+_SIG_COL_W    = 22    # Signals column: top-2 abbrevs + "+N" if more, no emoji
+_TOTAL_LEFT_W = _LEFT_W + len(_SEP) + _SIG_COL_W   # = 139 chars
 
 _RIGHT_W      = 62    # visible width of right signal panel (header = 60, data = 61)
 
 
 def _sig_abbrev(signals: list) -> str:
     """Compact text-only signal string for the Signals column in left table.
-    Shows highest-score signal abbrev + '+N' if more. No emoji. Fits _SIG_COL_W."""
+    Shows top-2 signal abbrevs; adds '+N' suffix when there are more.
+    No emoji. Always exactly _SIG_COL_W visible chars."""
     if not signals:
         return ' ' * _SIG_COL_W
     sorted_sigs = sorted(signals, key=lambda x: -x[2])
-    first = SIG_ABBR.get(sorted_sigs[0][0], sorted_sigs[0][0][:12])
-    text = first if len(sorted_sigs) == 1 else f"{first} +{len(sorted_sigs)-1}"
+    parts = [SIG_ABBR.get(s[0], s[0][:12]) for s in sorted_sigs[:2]]
+    text = ' '.join(parts)
+    if len(sorted_sigs) > 2:
+        text += f' +{len(sorted_sigs) - 2}'
     return f"{text[:_SIG_COL_W]:<{_SIG_COL_W}}"
 
 
